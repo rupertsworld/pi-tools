@@ -1,0 +1,23 @@
+{
+	"name": "@telepath-computer/pi-tools",
+	"private": true,
+	"version": "0.0.0",
+	"description": "Monorepo of pi packages: extensions and setup tooling for a preferred pi installation",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/telepath-computer/pi-tools.git"
+	},
+	"workspaces": [
+		"packages/*"
+	],
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^0.80.9",
+		"@types/node": "^26.1.1",
+		"typescript": "^7.0.2"
+	},
+	"scripts": {
+		"test": "npm run test --workspaces --if-present",
+		"typecheck": "tsc -p tsconfig.json"
+	}
+}

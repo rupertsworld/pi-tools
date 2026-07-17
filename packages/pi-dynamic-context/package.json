@@ -1,0 +1,26 @@
+{
+	"name": "@telepath-computer/pi-dynamic-context",
+	"version": "0.1.0",
+	"description": "Per-turn refresh of pi's system prompt and context files, with template variables",
+	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/telepath-computer/pi-tools.git",
+		"directory": "packages/pi-dynamic-context"
+	},
+	"files": [
+		"index.ts",
+		"SPEC.md",
+		"README.md"
+	],
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
+}

@@ -1,0 +1,29 @@
+{
+	"name": "@telepath-computer/pi-webhook",
+	"version": "0.1.0",
+	"description": "HTTP ingress for injecting messages into the active pi session",
+	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/telepath-computer/pi-tools.git",
+		"directory": "packages/pi-webhook"
+	},
+	"files": [
+		"index.ts",
+		"SPEC.md",
+		"README.md"
+	],
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"scripts": {
+		"test": "node --test test/*.test.ts"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
+}
