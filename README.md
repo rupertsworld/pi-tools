@@ -6,6 +6,7 @@ A monorepo of [pi](https://github.com/earendil-works/pi-mono) packages. Each pac
 
 | Package | Description |
 |---|---|
+| [`@telepath-computer/pi-acp`](packages/pi-acp) | ACP endpoint for driving a live pi session over a unix socket |
 | [`@telepath-computer/pi-webhook`](packages/pi-webhook) | HTTP ingress for injecting messages into the active pi session |
 | [`@telepath-computer/pi-dynamic-context`](packages/pi-dynamic-context) | Per-turn refresh of system prompt and context files, with template variables |
 
