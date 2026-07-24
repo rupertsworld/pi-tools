@@ -5,10 +5,10 @@ Monorepo of pi packages. Each package is spec-driven — `SPEC.md` is authoritat
 ## Packages
 
 ### pi-webhook — DONE
-HTTP ingress for injecting messages into the receiving session. Delivery is `followUp` (never interrupts, #6). Browser access via `allowedOrigins` in `webhook.json` — server-side origin enforcement + CORS preflight, `"*"` supported, no token by design (#7). Lifecycle is attach semantics: `/webhook attach [port] | detach | status`, receiver recorded as `sessionId` in `webhook.json`, auto-reattach on session start (#7). 33 tests. Rupert's install: bind `100.80.116.2`, `allowedOrigins ["*"]`; the Today artifact pings it on task check-off (convention in the tv-tasks skill).
+HTTP ingress for injecting messages into the receiving session. Delivery is `followUp` (never interrupts, #6). Browser access via `allowedOrigins` in `webhook.json` — server-side origin enforcement + CORS preflight, `"*"` supported, no token by design (#7). Lifecycle is attach semantics: `/webhook attach [port] | detach | status`, receiver recorded as `sessionId` in `webhook.json`, auto-reattach on session start (#7). 36 tests.
 
-### pi-dynamic-context — IN PROGRESS
-Per-turn refresh of system prompt + context files, with template variables (`{{DATE}}`, `{{TIME}}`, `{{TZ}}`, `{{AGENT_DIR}}`, `{{CWD}}`). Exact-content substitution via `before_agent_start` (no pi internals, no prompt-layout matching). SPEC written; implementation underway.
+### pi-dynamic-context — DONE
+Per-turn refresh of system prompt + context files, with template variables (`{{DATE}}`, `{{TIME}}`, `{{TZ}}`, `{{AGENT_DIR}}`, `{{CWD}}`), host time zone only. Exact-content substitution via `before_agent_start`. Implemented (#10), 13 unit tests + registration e2e (#12), live-smoked mid-session AGENTS.md refresh via `scripts/smoke-dynamic-context.mjs`.
 
 ### pi-runner — FEATURE-COMPLETE (branch `runner-subagents` awaiting PR)
 Session-scoped job engine: `{trigger, action, deliverAs}` — triggers `cron`/`once`/`now`, actions `prompt`/`command`/`subagent` (lean steerable `pi --mode rpc` children, `maxMinutes` cap), delivery in pi's `sendMessage` vocabulary. Per-action creator tools (`prompt`/`process`/`subagent`) + `cancel`/`steer`/`peek`/`list`, all with house-style rendering. Per-session persistence, full per-job logs (`runner/logs/<jobId>.log`) readable via `peek`, footer chip `runner N scheduled · M running`. 57 tests + real-pi e2e; child RPC protocol proven live. Deferred scope in `packages/pi-runner/TODO.md`.

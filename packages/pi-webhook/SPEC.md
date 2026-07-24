@@ -38,7 +38,7 @@ Configuration lives in `webhook.json` in the coding-agent home (`$PI_CODING_AGEN
 Defaults: bind `127.0.0.1`, port `3729`, `allowedOrigins: []`, no `sessionId`.
 
 - `bind` — set to a Tailscale IP to accept senders from other tailnet devices; the tailnet then authenticates machines.
-- `allowedOrigins` — array of exact origins (scheme + host + port, e.g. `"http://100.80.116.2:32848"`) permitted as browser senders, or `["*"]` for any origin.
+- `allowedOrigins` — array of exact origins (scheme + host + port, e.g. `"http://100.101.102.103:8080"`) permitted as browser senders, or `["*"]` for any origin.
 
 An unreadable or invalid config warns and falls back to defaults.
 
