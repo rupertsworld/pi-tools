@@ -8,7 +8,6 @@ Monorepo of pi packages. Each package is spec-driven — `SPEC.md` is authoritat
 HTTP ingress for injecting messages into the active session. Command-driven lifecycle (`/webhook start [port] | stop | status`), no auto-start. Implemented, 24 tests passing. Installed into global `~/.pi/agent` via local path for live-edit use.
 
 Pending (decided, not yet implemented):
-- **Injection delivery**: switch `pi.sendMessage` from `deliverAs: "steer"` to `"followUp"` (keep `triggerTurn: true`). Steer interrupts an in-progress turn; an async external message should wait, not hijack. Update `index.ts`, SPEC line, and test.
 - **Web-app access over Tailscale**: today the webhook blocks browsers (`Origin` → 403, no CORS preflight) because it has no auth. To let a tailnet web app POST: bind to the Tailscale IP (config-only), add token auth (secret in `webhook.json`, `Authorization: Bearer` → 401 otherwise — this is the real security boundary; CORS is NOT, since it doesn't stop a fire-and-forget POST's side effect), handle CORS/OPTIONS with an origin allowlist, and drop the Origin-403 heuristic. Fulfils the SPEC's "authentication is future work". Confirm topology (pi on one tailnet box, browser on another device) before building.
 
 ### pi-dynamic-context — IN PROGRESS

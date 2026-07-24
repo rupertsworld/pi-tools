@@ -264,7 +264,7 @@ describe("webhook http handling", () => {
 		assert.deepEqual(stub.sendMessageCalls, [
 			{
 				message: { customType: "webhook", content: "hi", display: true },
-				options: { triggerTurn: true, deliverAs: "steer" },
+				options: { triggerTurn: true, deliverAs: "followUp" },
 			},
 		]);
 	});

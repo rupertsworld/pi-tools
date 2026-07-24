@@ -21,7 +21,7 @@ It loads through the `packages` array of pi's settings like any other package. N
 - `POST /message` with body `{"message": "..."}` injects the message into the session and responds `202` with a small JSON acknowledgement. A missing or empty message is a `400`. The request never waits for the agent's reply.
 - Requests must send `Content-Type: application/json` (`415` otherwise) and must not carry an `Origin` header (`403`): browsers are not valid senders, which closes cross-origin injection from web pages without requiring auth. The body is capped at 1 MB (`413`).
 - Injection uses pi's custom-message API (`pi.sendMessage`) with `customType: "webhook"` and `display: true`: the message is shown in the transcript, included in LLM context, and recorded as arriving via webhook rather than as user-typed input.
-- If the agent is idle, the injection triggers a turn (`triggerTurn: true`). If the agent is streaming, the message queues as steering (`deliverAs: "steer"`).
+- If the agent is idle, the injection triggers a turn (`triggerTurn: true`). If the agent is mid-turn, the message waits until the current turn finishes (`deliverAs: "followUp"`) — an external message never interrupts in-progress work.
 - The webhook is session-local: one session owns the port. A `/webhook start` that cannot bind notifies and the session continues without the webhook. It does not crash.
 - Sessions without command entry (print mode, RPC) cannot start the webhook. Automatic startup is deliberately not provided; ingress for headless runs is out of scope for now.
 

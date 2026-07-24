@@ -169,7 +169,7 @@ export default function (pi: ExtensionAPI) {
 
 		pi.sendMessage(
 			{ customType: "webhook", content: message, display: true },
-			{ triggerTurn: true, deliverAs: "steer" },
+			{ triggerTurn: true, deliverAs: "followUp" },
 		);
 		sendJson(response, 202, { ok: true });
 	}
