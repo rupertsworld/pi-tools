@@ -29,6 +29,7 @@ It loads through the `packages` array of pi's settings like any other package. N
 - If the agent is idle, the injection triggers a turn (`triggerTurn: true`). If the agent is mid-turn, the message waits until the current turn finishes (`deliverAs: "followUp"`) — an external message never interrupts in-progress work.
 - The webhook is session-local: one session owns the port. A `/webhook attach` that cannot bind notifies and the session continues without the webhook. It does not crash.
 - Sessions without command entry (print mode, RPC) cannot start the webhook. Automatic startup is deliberately not provided; ingress for headless runs is out of scope for now.
+- The receiving session shows its attach state in pi's footer status (`ctx.ui.setStatus`), styled like the telegram/runner status chips (accent label, colored value, no colon): `webhook <bind>:<port>` with the address in the success color while listening, and `webhook port held` in the warning color when this session is attached but the bind failed (another session still holds the port). Sessions that are not attached show nothing — the status is cleared on detach and never set elsewhere. Updated on attach, detach, `session_start` reattach, bind failure, post-listen server error, and shutdown; skipped without a UI (`ctx.hasUI`).
 
 ## Configuration
 

@@ -4,11 +4,8 @@ Monorepo of pi packages. Each package is spec-driven — `SPEC.md` is authoritat
 
 ## Packages
 
-### pi-webhook — DONE, with pending changes
-HTTP ingress for injecting messages into the active session. Command-driven lifecycle (`/webhook start [port] | stop | status`), no auto-start. Implemented, 24 tests passing. Installed into global `~/.pi/agent` via local path for live-edit use.
-
-Pending (decided, not yet implemented):
-- **Web-app access over Tailscale**: today the webhook blocks browsers (`Origin` → 403, no CORS preflight) because it has no auth. To let a tailnet web app POST: bind to the Tailscale IP (config-only), add token auth (secret in `webhook.json`, `Authorization: Bearer` → 401 otherwise — this is the real security boundary; CORS is NOT, since it doesn't stop a fire-and-forget POST's side effect), handle CORS/OPTIONS with an origin allowlist, and drop the Origin-403 heuristic. Fulfils the SPEC's "authentication is future work". Confirm topology (pi on one tailnet box, browser on another device) before building.
+### pi-webhook — DONE
+HTTP ingress for injecting messages into the receiving session. Delivery is `followUp` (never interrupts, #6). Browser access via `allowedOrigins` in `webhook.json` — server-side origin enforcement + CORS preflight, `"*"` supported, no token by design (#7). Lifecycle is attach semantics: `/webhook attach [port] | detach | status`, receiver recorded as `sessionId` in `webhook.json`, auto-reattach on session start (#7). 33 tests. Rupert's install: bind `100.80.116.2`, `allowedOrigins ["*"]`; the Today artifact pings it on task check-off (convention in the tv-tasks skill).
 
 ### pi-dynamic-context — IN PROGRESS
 Per-turn refresh of system prompt + context files, with template variables (`{{DATE}}`, `{{TIME}}`, `{{TZ}}`, `{{AGENT_DIR}}`, `{{CWD}}`). Exact-content substitution via `before_agent_start` (no pi internals, no prompt-layout matching). SPEC written; implementation underway.

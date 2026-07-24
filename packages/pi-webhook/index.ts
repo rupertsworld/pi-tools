@@ -30,15 +30,21 @@ const USAGE = "Usage: /webhook attach [port] | detach | status";
 
 export default function (pi: ExtensionAPI) {
 	let server: Server | undefined;
+	let lifecycleGeneration = 0;
 
 	pi.on("session_start", async (_event, ctx) => {
 		const config = await loadConfig(ctx, false, false);
-		if (config?.sessionId !== ctx.sessionManager.getSessionId()) return;
-		server = await startServer(config, ctx);
+		if (config?.sessionId !== ctx.sessionManager.getSessionId()) {
+			updateStatus(ctx, "clear");
+			return;
+		}
+		const started = await startServer(config, ctx);
+		if (started) server = started;
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		await stopServer();
+		updateStatus(ctx, "clear");
 	});
 
 	pi.registerCommand("webhook", {
@@ -76,16 +82,21 @@ export default function (pi: ExtensionAPI) {
 		config.sessionId = ctx.sessionManager.getSessionId();
 		if (!(await writeConfig(config, ctx))) return;
 		if (server) {
+			updateStatus(ctx, "listening", config);
 			notify(ctx, await statusMessage(ctx), "info");
 			return;
 		}
-		server = await startServer(config, ctx);
-		if (server) notify(ctx, await statusMessage(ctx), "info");
+		const started = await startServer(config, ctx);
+		if (started) {
+			server = started;
+			notify(ctx, await statusMessage(ctx), "info");
+		}
 	}
 
 	async function handleDetach(ctx: ExtensionContext): Promise<void> {
 		const wasRunning = server !== undefined;
 		await stopServer();
+		updateStatus(ctx, "clear");
 		const config = await loadConfig(ctx, false, true);
 		if (config) {
 			delete config.sessionId;
@@ -107,6 +118,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function startServer(config: WebhookConfig, ctx: ExtensionContext): Promise<Server | undefined> {
+		const generation = ++lifecycleGeneration;
 		return new Promise((resolve) => {
 			const candidate = createServer((request, response) => {
 				handleRequest(request, response, config).catch(() => {
@@ -116,6 +128,11 @@ export default function (pi: ExtensionAPI) {
 			});
 			const onBindError = (error: Error) => {
 				candidate.close();
+				if (generation !== lifecycleGeneration) {
+					resolve(undefined);
+					return;
+				}
+				updateStatus(ctx, "port-held");
 				notify(
 					ctx,
 					`Webhook failed to listen on ${config.bind}:${config.port} (${error.message}). Another session may still hold the port; it releases on shutdown or /webhook detach. Continuing without webhook.`,
@@ -126,15 +143,27 @@ export default function (pi: ExtensionAPI) {
 			candidate.once("error", onBindError);
 			candidate.listen(config.port, config.bind, () => {
 				candidate.removeListener("error", onBindError);
+				if (generation !== lifecycleGeneration) {
+					candidate.close();
+					resolve(undefined);
+					return;
+				}
 				candidate.on("error", (error) => {
+					if (server !== candidate) return;
 					notify(ctx, `Webhook server error: ${error.message}.`, "error");
+					if (!candidate.listening) {
+						server = undefined;
+						updateStatus(ctx, "error");
+					}
 				});
+				updateStatus(ctx, "listening", config, candidate);
 				resolve(candidate);
 			});
 		});
 	}
 
 	async function stopServer(): Promise<void> {
+		lifecycleGeneration += 1;
 		if (!server) return;
 		const closing = server;
 		server = undefined;
@@ -142,6 +171,35 @@ export default function (pi: ExtensionAPI) {
 			closing.close(() => resolve());
 			closing.closeAllConnections();
 		});
+	}
+
+	function updateStatus(
+		ctx: ExtensionContext,
+		state: "listening" | "port-held" | "error" | "clear",
+		config?: WebhookConfig,
+		listeningServer: Server | undefined = server,
+	): void {
+		if (!ctx.hasUI) return;
+		let value: string | undefined;
+		let color: "success" | "warning" = "success";
+		if (state === "listening") {
+			const address = listeningServer?.address();
+			value =
+				address && typeof address === "object"
+					? `${address.address}:${address.port}`
+					: `${config?.bind ?? DEFAULT_CONFIG.bind}:${config?.port ?? DEFAULT_CONFIG.port}`;
+		} else if (state === "port-held") {
+			value = "port held";
+			color = "warning";
+		} else if (state === "error") {
+			value = "error";
+			color = "warning";
+		}
+		const text =
+			value === undefined
+				? undefined
+				: `${ctx.ui.theme.fg("accent", "webhook")} ${ctx.ui.theme.fg(color, value)}`;
+		ctx.ui.setStatus("webhook", text);
 	}
 
 	async function handleRequest(request: IncomingMessage, response: ServerResponse, config: WebhookConfig): Promise<void> {

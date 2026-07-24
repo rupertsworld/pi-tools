@@ -23,9 +23,14 @@ interface StubCtx {
 	ctx: {
 		hasUI: boolean;
 		sessionManager: { getSessionId: () => string };
-		ui: { notify: (message: string, type?: string) => void };
+		ui: {
+			notify: (message: string, type?: string) => void;
+			setStatus: (key: string, text: string | undefined) => void;
+			theme: { fg: (color: string, text: string) => string };
+		};
 	};
 	notifications: Array<{ message: string; type?: string }>;
+	statusCalls: Array<{ key: string; text: string | undefined }>;
 }
 
 const sessionId = "test-session";
@@ -75,6 +80,19 @@ describe("webhook lifecycle", () => {
 			body: JSON.stringify({ message: "attached" }),
 		});
 		assert.equal(response.status, 202);
+	});
+
+	it("shows the actual bound address in the footer after attach", async () => {
+		await writeConfig({ bind: "127.0.0.1", port: 0, allowedOrigins: [] });
+		const ctx = createStubCtx();
+
+		await runCommandWithCtx("attach", ctx);
+
+		const status = await commandStatus();
+		const address = new URL(statusAddress(status)).host;
+		assert.deepEqual(ctx.statusCalls, [
+			{ key: "webhook", text: `<accent:webhook> <success:${address}>` },
+		]);
 	});
 
 	it("creates defaults with allowedOrigins and updates a supplied port in webhook.json", async () => {
@@ -140,13 +158,17 @@ describe("webhook lifecycle", () => {
 		try {
 			await writeConfig({ bind: "127.0.0.1", port, allowedOrigins: [] });
 
-			const notifications = await runCommand("attach");
+			const ctx = createStubCtx();
+			await runCommandWithCtx("attach", ctx);
 
-			assert.ok(notifications.some((entry) =>
+			assert.ok(ctx.notifications.some((entry) =>
 				entry.type === "error" && /another session/i.test(entry.message) && /shutdown|detach/i.test(entry.message),
-			), JSON.stringify(notifications));
+			), JSON.stringify(ctx.notifications));
 			assert.equal((await readConfig()).sessionId, sessionId);
 			assert.match(await commandStatus(), /not running/i);
+			assert.deepEqual(ctx.statusCalls, [
+				{ key: "webhook", text: "<accent:webhook> <warning:port held>" },
+			]);
 		} finally {
 			await new Promise<void>((resolve) => blocker.close(() => resolve()));
 		}
@@ -168,7 +190,8 @@ describe("webhook lifecycle", () => {
 		await runCommand("attach");
 		const address = statusAddress(await commandStatus());
 
-		await runCommand("detach");
+		const ctx = createStubCtx();
+		await runCommandWithCtx("detach", ctx);
 
 		await assert.rejects(fetch(`${address}/message`, { method: "POST", body: "{}" }));
 		assert.deepEqual(await readConfig(), {
@@ -177,6 +200,7 @@ describe("webhook lifecycle", () => {
 			allowedOrigins: ["https://app.example"],
 		});
 		assert.match(await commandStatus(), /not attached/i);
+		assert.deepEqual(ctx.statusCalls, [{ key: "webhook", text: undefined }]);
 	});
 
 	it("detach clears ownership even when this session is not serving", async () => {
@@ -207,7 +231,8 @@ describe("webhook lifecycle", () => {
 	it("session_start serves only when the configured sessionId matches", async () => {
 		await writeConfig({ bind: "127.0.0.1", port: 0, allowedOrigins: [], sessionId });
 
-		await fireEvent("session_start", createStubCtx());
+		const ctx = createStubCtx();
+		await fireEvent("session_start", ctx);
 
 		const response = await fetch(`${statusAddress(await commandStatus())}/message`, {
 			method: "POST",
@@ -215,6 +240,7 @@ describe("webhook lifecycle", () => {
 			body: JSON.stringify({ message: "restored" }),
 		});
 		assert.equal(response.status, 202);
+		assert.match(ctx.statusCalls[0]?.text ?? "", /^<accent:webhook> <success:127\.0\.0\.1:\d+>$/);
 	});
 
 	it("session_start does nothing for different or absent ownership", async () => {
@@ -239,10 +265,54 @@ describe("webhook lifecycle", () => {
 	it("session_shutdown stops serving but leaves ownership in config", async () => {
 		const address = await startOnEphemeralPort();
 
-		await fireEvent("session_shutdown", createStubCtx());
+		const ctx = createStubCtx();
+		await fireEvent("session_shutdown", ctx);
 
 		await assert.rejects(fetch(`${address}/message`, { method: "POST", body: "{}" }));
 		assert.equal((await readConfig()).sessionId, sessionId);
+		assert.deepEqual(ctx.statusCalls, [{ key: "webhook", text: undefined }]);
+	});
+
+	it("does not restore status when a pending attach finishes after shutdown", async (t) => {
+		const originalListen = Server.prototype.listen;
+		let releaseListen: (() => void) | undefined;
+		Server.prototype.listen = function (this: Server, ...args: unknown[]) {
+			const callback = args.at(-1);
+			assert.equal(typeof callback, "function");
+			args[args.length - 1] = () => {
+				releaseListen = callback as () => void;
+			};
+			return (originalListen as (...listenArgs: unknown[]) => Server).apply(this, args);
+		} as typeof originalListen;
+		t.after(() => {
+			Server.prototype.listen = originalListen;
+		});
+
+		await writeConfig({ bind: "127.0.0.1", port: 0, allowedOrigins: [] });
+		const attachCtx = createStubCtx();
+		const attach = runCommandWithCtx("attach", attachCtx);
+		while (!releaseListen) await new Promise((resolve) => setImmediate(resolve));
+
+		const shutdownCtx = createStubCtx();
+		await fireEvent("session_shutdown", shutdownCtx);
+		releaseListen();
+		await attach;
+
+		assert.deepEqual(attachCtx.statusCalls, []);
+		assert.deepEqual(shutdownCtx.statusCalls, [{ key: "webhook", text: undefined }]);
+		assert.match(await commandStatus(), /not running/i);
+	});
+
+	it("does not update footer status without a UI", async () => {
+		await writeConfig({ bind: "127.0.0.1", port: 0, allowedOrigins: [] });
+		const ctx = createStubCtx();
+		ctx.ctx.hasUI = false;
+
+		await assert.doesNotReject(runCommandWithCtx("attach", ctx));
+		await assert.doesNotReject(runCommandWithCtx("detach", ctx));
+		await assert.doesNotReject(fireEvent("session_shutdown", ctx));
+
+		assert.deepEqual(ctx.statusCalls, []);
 	});
 
 	it("status and bare command report the configured attached session", async () => {
@@ -275,20 +345,27 @@ describe("webhook lifecycle", () => {
 		});
 
 		await writeConfig({ bind: "127.0.0.1", port: 0 });
-		const notifications = await runCommand("attach");
+		const ctx = createStubCtx();
+		await runCommandWithCtx("attach", ctx);
 		assert.equal(created.length, 1);
+		const listeningStatus = ctx.statusCalls.at(-1);
 
 		created[0]!.emit("error", new Error("boom"));
 
 		assert.ok(
-			notifications.some((entry) => entry.type === "error" && /boom/.test(entry.message)),
-			JSON.stringify(notifications),
+			ctx.notifications.some((entry) => entry.type === "error" && /boom/.test(entry.message)),
+			JSON.stringify(ctx.notifications),
 		);
 		assert.ok(
-			notifications.every((entry) => !/failed to listen/i.test(entry.message)),
-			JSON.stringify(notifications),
+			ctx.notifications.every((entry) => !/failed to listen/i.test(entry.message)),
+			JSON.stringify(ctx.notifications),
 		);
+		assert.deepEqual(ctx.statusCalls.at(-1), listeningStatus);
 		assert.match(await commandStatus(), /listening/i);
+
+		await fireEvent("session_shutdown", ctx);
+		created[0]!.emit("error", new Error("late boom"));
+		assert.deepEqual(ctx.statusCalls.at(-1), { key: "webhook", text: undefined });
 	});
 });
 
@@ -541,6 +618,7 @@ function createStubPi(): StubPi {
 
 function createStubCtx(): StubCtx {
 	const notifications: StubCtx["notifications"] = [];
+	const statusCalls: StubCtx["statusCalls"] = [];
 	return {
 		ctx: {
 			hasUI: true,
@@ -549,9 +627,18 @@ function createStubCtx(): StubCtx {
 				notify(message: string, type?: string) {
 					notifications.push({ message, type });
 				},
+				setStatus(key, text) {
+					statusCalls.push({ key, text });
+				},
+				theme: {
+					fg(color, text) {
+						return `<${color}:${text}>`;
+					},
+				},
 			},
 		},
 		notifications,
+		statusCalls,
 	};
 }
 
@@ -563,11 +650,15 @@ async function fireEvent(event: string, stubCtx: StubCtx | StubCtx["ctx"]): Prom
 }
 
 async function runCommand(args: string): Promise<StubCtx["notifications"]> {
+	const ctx = createStubCtx();
+	await runCommandWithCtx(args, ctx);
+	return ctx.notifications;
+}
+
+async function runCommandWithCtx(args: string, stubCtx: StubCtx): Promise<void> {
 	const command = stub.commands.get("webhook");
 	assert.ok(command, "webhook command not registered");
-	const { ctx, notifications } = createStubCtx();
-	await command.handler(args, ctx);
-	return notifications;
+	await command.handler(args, stubCtx.ctx);
 }
 
 async function commandStatus(): Promise<string> {
