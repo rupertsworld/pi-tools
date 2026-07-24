@@ -12,7 +12,8 @@
 		"packages/*"
 	],
 	"devDependencies": {
-		"@earendil-works/pi-coding-agent": "^0.80.9",
+		"@earendil-works/pi-ai": "^0.81.1",
+		"@earendil-works/pi-coding-agent": "^0.81.1",
 		"@types/node": "^26.1.1",
 		"typescript": "^7.0.2"
 	},
