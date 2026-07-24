@@ -35,4 +35,10 @@ npm test            # all workspace test suites
 npm run typecheck   # strict tsc across packages
 ```
 
+pi-runner and pi-dynamic-context also carry registration-level e2e tests that load the extension through a real pi session. For pi-dynamic-context there is additionally a manual live smoke (real model call, so not part of `npm test`) worth running after pi upgrades:
+
+```sh
+node scripts/smoke-dynamic-context.mjs
+```
+
 Time zones, by design: nothing in these packages takes a timezone setting — cron schedules and template variables evaluate in the host zone. The box's clock is the single source of truth.
