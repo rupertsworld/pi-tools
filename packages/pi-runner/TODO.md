@@ -17,7 +17,7 @@ When actions are added, the `schedule` tool input generalizes from `{ message, t
 
 ## Persistence
 
-Persist schedules per session to disk; restore on `/resume`, clear on `/new`. Today schedules are in-memory only and lost on restart.
+Specified in `SPEC.md` ("Session scope and persistence") — per-session files at `~/.pi/agent/runner/<sessionId>.json`, restored on `session_start`. Implementation in progress.
 
 ## Durable daemon (bigger fork)
 

@@ -67,14 +67,22 @@ pi.sendMessage(
 
 A **cron** schedule fires each time its expression matches, until cancelled. A **once** schedule fires a single time, then is removed automatically.
 
-## Session scope
+## Session scope and persistence
 
-Runner runs inside the pi session process; its timers live and die with the session:
+Schedules belong to the session that created them. Each session owns its own set of scheduled prompts, so an independent session (say, a coding session with a 15-minute timer) and a long-lived session holding standing daily crons do not interfere.
 
-- Schedules are cleared on `session_shutdown`.
-- They are held in memory for the life of the session. They do not currently persist across `/resume` or restart (persistence is future work — see [TODO.md](TODO.md)).
-- Cron and one-shot schedules only fire while a session is running. There is no background daemon: a scheduled prompt needs a live session to inject into.
+Schedules persist per session, keyed by session id:
+
+- Each session's jobs are stored in `~/.pi/agent/runner/<sessionId>.json` (under `$PI_CODING_AGENT_DIR`), where `<sessionId>` is the current session id (`ctx.sessionManager.getSessionId()`). One file per session, so concurrent sessions never write over each other.
+- The file is written on every `schedule` and `cancel`.
+- On `session_start`, runner reads the current session's file and reschedules its jobs. So `/resume` restores that session's schedules across restarts; `/new` starts empty; each resumed session restores exactly what it had.
+- On `session_shutdown`, runner stops the in-memory timers but keeps the file — that is what survives.
+- Each job stores only its definition (`jobId`, `message`, `trigger`); live `croner` timers are reconstructed on load.
+
+On reload, a `once` job whose time already passed while the session was closed is dropped (a reminder firing hours late is noise). A `cron` job simply resumes its normal schedule — missed ticks are not caught up.
+
+Runner is still session-scoped, not a daemon: cron and one-shot schedules only fire while their owning session is running, and a scheduled prompt needs a live session to inject into. Firing while no session is open remains out of scope (see [TODO.md](TODO.md)).
 
 ## Status
 
-Implemented in `index.ts`. Covered by unit tests plus an end-to-end test that loads the extension through a real pi session and validates the registered tool schemas.
+Scheduling and firing are implemented in `index.ts`, covered by unit tests plus an end-to-end test that loads the extension through a real pi session and validates the registered tool schemas. Per-session persistence (the "Session scope and persistence" section) is specified but not yet implemented.

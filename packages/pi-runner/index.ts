@@ -1,10 +1,13 @@
 /**
  * Runner extension: schedule prompts for injection into the active session.
  *
- * Jobs are session-scoped and held only in memory. See SPEC.md.
+ * Jobs are session-scoped and persisted between session loads. See SPEC.md.
  */
 
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -38,8 +41,34 @@ interface JobDetails {
 	nextRunAt: string;
 }
 
+type JobDefinition = Pick<Job, "jobId" | "message" | "trigger">;
+
 export default function (pi: ExtensionAPI) {
 	const jobs = new Map<string, Job>();
+
+	pi.on("session_start", async (_event, ctx) => {
+		try {
+			const definitions = await readJobs(ctx);
+			let droppedJob = false;
+			for (const definition of definitions) {
+				if (definition.trigger.kind === "once" && Date.parse(definition.trigger.at) <= Date.now()) {
+					droppedJob = true;
+					continue;
+				}
+				try {
+					const job = createJob(definition.jobId, definition.message, definition.trigger, ctx);
+					jobs.set(job.jobId, job);
+				} catch (error) {
+					notify(ctx, `Runner could not restore scheduled prompt ${definition.jobId} (${describeError(error)}).`, "warning");
+				}
+			}
+			if (droppedJob) await writeJobs(ctx);
+		} catch (error) {
+			if (!isFileNotFound(error)) {
+				notify(ctx, `Runner could not load persisted schedules (${describeError(error)}).`, "warning");
+			}
+		}
+	});
 
 	pi.on("session_shutdown", () => {
 		for (const job of jobs.values()) stopJob(job);
@@ -68,6 +97,7 @@ export default function (pi: ExtensionAPI) {
 			const jobId = randomUUID();
 			const job = createJob(jobId, params.message, params.trigger, ctx);
 			jobs.set(jobId, job);
+			await writeJobs(ctx);
 			const details = describeJob(job);
 			return toolResult(`Scheduled prompt ${jobId} for ${details.nextRunAt}.`, details);
 		},
@@ -80,14 +110,16 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			jobId: Type.String({ description: "ID returned by schedule" }),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const job = jobs.get(params.jobId);
 			if (!job) {
+				await writeJobs(ctx);
 				const details = { jobId: params.jobId, found: false, cancelled: false };
 				return toolResult(`No active scheduled prompt found for ${params.jobId}.`, details);
 			}
 			jobs.delete(params.jobId);
 			stopJob(job);
+			await writeJobs(ctx);
 			const details = { jobId: params.jobId, found: true, cancelled: true };
 			return toolResult(`Cancelled scheduled prompt ${params.jobId}.`, details);
 		},
@@ -147,10 +179,11 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
-	function fireJob(jobId: string): void {
+	async function fireJob(jobId: string): Promise<void> {
 		const job = jobs.get(jobId);
 		if (!job) return;
-		if (job.trigger.kind === "once") {
+		const isOnce = job.trigger.kind === "once";
+		if (isOnce) {
 			jobs.delete(jobId);
 			stopJob(job);
 		}
@@ -162,7 +195,31 @@ export default function (pi: ExtensionAPI) {
 		} catch (error) {
 			notify(job.context, `Runner could not inject scheduled prompt ${jobId} (${describeError(error)}).`, "error");
 		}
+		if (isOnce) await writeJobs(job.context);
 	}
+
+	async function readJobs(ctx: ExtensionContext): Promise<JobDefinition[]> {
+		const contents = await fs.readFile(persistencePath(ctx), "utf8");
+		const definitions: unknown = JSON.parse(contents);
+		if (!Array.isArray(definitions)) throw new Error("persisted schedules must be an array");
+		return definitions as JobDefinition[];
+	}
+
+	async function writeJobs(ctx: ExtensionContext): Promise<void> {
+		try {
+			const filePath = persistencePath(ctx);
+			await fs.mkdir(path.dirname(filePath), { recursive: true });
+			const definitions = [...jobs.values()].map(serializeJob);
+			await fs.writeFile(filePath, JSON.stringify(definitions, null, "\t"));
+		} catch (error) {
+			notify(ctx, `Runner could not persist schedules (${describeError(error)}).`, "warning");
+		}
+	}
+}
+
+function persistencePath(ctx: ExtensionContext): string {
+	const agentDir = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
+	return path.join(agentDir, "runner", `${ctx.sessionManager.getSessionId()}.json`);
 }
 
 function parseOnceTime(at: string): Date {
@@ -204,6 +261,23 @@ function describeJob(job: Job): JobDetails {
 	};
 }
 
+function serializeJob(job: Job): JobDefinition {
+	if (job.trigger.kind === "once") {
+		const nextRun = job.cron.nextRun();
+		if (!nextRun) throw new Error(`Scheduled prompt ${job.jobId} has no future run.`);
+		return {
+			jobId: job.jobId,
+			message: job.message,
+			trigger: { kind: "once", at: nextRun.toISOString() },
+		};
+	}
+	return {
+		jobId: job.jobId,
+		message: job.message,
+		trigger: job.trigger,
+	};
+}
+
 function stopJob(job: Job): void {
 	job.cron.stop();
 }
@@ -221,4 +295,8 @@ function notify(ctx: ExtensionContext, message: string, type: "info" | "warning"
 
 function describeError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function isFileNotFound(error: unknown): boolean {
+	return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
