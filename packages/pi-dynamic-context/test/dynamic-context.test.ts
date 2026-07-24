@@ -119,9 +119,11 @@ function warningsMatching(pattern: RegExp): number {
 }
 
 describe("template variables", () => {
-	it("renders all variables in SYSTEM.md content using the configured time zone", async () => {
+	it("renders all variables in SYSTEM.md content using the host time zone", async () => {
 		const template = "date={{DATE}}\ntime={{TIME}}\ntz={{TZ}}\nagent={{AGENT_DIR}}\ncwd={{CWD}}";
-		await writeFile(join(agentDir, "dynamic-context.json"), JSON.stringify({ timeZone: "Australia/Sydney" }), "utf8");
+		const hostTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+		const otherTimeZone = hostTimeZone === "Australia/Sydney" ? "America/Los_Angeles" : "Australia/Sydney";
+		await writeFile(join(agentDir, "dynamic-context.json"), JSON.stringify({ timeZone: otherTimeZone }), "utf8");
 		await writeFile(join(agentDir, "SYSTEM.md"), template, "utf8");
 
 		const result = await runTurn(buildPrompt({ customPrompt: template }), { customPrompt: template });
@@ -129,7 +131,9 @@ describe("template variables", () => {
 		assert.ok(result, "prompt must be modified");
 		assert.match(result, /date=\d{4}-\d{2}-\d{2}\n/);
 		assert.match(result, /time=\d{2}:\d{2}:\d{2}\n/);
-		assert.ok(result.includes("tz=Australia/Sydney"));
+		assert.match(result, /tz=(?:[A-Za-z_+-]+(?:\/[A-Za-z0-9_+-]+)+|UTC[+-]\d{2}:\d{2})\n/);
+		if (hostTimeZone) assert.ok(result.includes(`tz=${hostTimeZone}`));
+		assert.ok(!result.includes(`tz=${otherTimeZone}`), "legacy config does not override the host time zone");
 		assert.ok(result.includes(`agent=${agentDir}`));
 		assert.ok(result.includes(`cwd=${projectDir}`));
 		assert.ok(result.includes("<tools>"), "the rest of the prompt is preserved");
@@ -276,34 +280,6 @@ describe("per-turn refresh", () => {
 		assert.ok(second?.includes("REWRITTEN BY ANOTHER EXTENSION"), "rewritten piece left alone");
 		assert.ok(!second?.includes("system two"), "no guessing where the rewritten piece went");
 		assert.ok(second?.includes("context two"), "intact pieces still refresh");
-	});
-});
-
-describe("configuration", () => {
-	it("warns once and falls back to the host time zone on an invalid timeZone", async () => {
-		await writeFile(join(agentDir, "dynamic-context.json"), JSON.stringify({ timeZone: "Not/AZone" }), "utf8");
-		const template = "tz={{TZ}}";
-		await writeFile(join(agentDir, "SYSTEM.md"), template, "utf8");
-		const base = buildPrompt({ customPrompt: template });
-
-		const first = await runTurn(base, { customPrompt: template });
-		await runTurn(base, { customPrompt: template });
-
-		const hostTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-		assert.ok(first?.includes(`tz=${hostTz}`), `falls back to host tz ${hostTz}`);
-		assert.equal(warningsMatching(/Not\/AZone|dynamic-context\.json/), 1, "warns once per session");
-	});
-
-	it("warns and uses defaults when the config file is not valid JSON", async () => {
-		await writeFile(join(agentDir, "dynamic-context.json"), "not json {{", "utf8");
-		const template = "tz={{TZ}}";
-		await writeFile(join(agentDir, "SYSTEM.md"), template, "utf8");
-
-		const result = await runTurn(buildPrompt({ customPrompt: template }), { customPrompt: template });
-
-		const hostTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-		assert.ok(result?.includes(`tz=${hostTz}`));
-		assert.equal(warningsMatching(/dynamic-context\.json/), 1);
 	});
 });
 
