@@ -74,6 +74,10 @@ The result is then delivered via `pi.sendMessage({ customType: "runner", content
 
 A **cron** job fires each time its expression matches, until cancelled. A **once** job fires a single time, then is removed automatically.
 
+## Status line
+
+Runner shows the current job count in pi's footer status (`ctx.ui.setStatus`): `runner 3 jobs` (`1 job` singular). The `runner` label uses the theme accent color and the count uses the success color, matching the telegram extension's status style. The status updates whenever the count changes — on load at `session_start`, `schedule`, `cancel`, and a `once` job firing — and is **cleared entirely at zero jobs**, so sessions that don't use runner carry no footer noise. Sessions without a UI skip the status (guarded by `ctx.hasUI`).
+
 ## Session scope and persistence
 
 Jobs belong to the session that created them. Each session owns its own set of jobs, so an independent session (say, a coding session with a 15-minute `git fetch`) and a long-lived session holding standing daily crons do not interfere.

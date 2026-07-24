@@ -121,6 +121,7 @@ export default function (pi: ExtensionAPI) {
 				notify(ctx, `Runner could not load persisted schedules (${describeError(error)}).`, "warning");
 			}
 		}
+		updateStatus(ctx, jobs.size);
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -168,6 +169,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			const job = createJob(definition, ctx);
 			jobs.set(job.jobId, job);
+			updateStatus(ctx, jobs.size);
 			await writeJobs(ctx);
 			const details = describeJob(job);
 			return toolResult(`Scheduled job ${job.jobId} for ${details.nextRunAt}.`, details);
@@ -190,6 +192,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			jobs.delete(params.jobId);
 			firingJobs.delete(params.jobId);
+			updateStatus(ctx, jobs.size);
 			await stopJob(job);
 			await writeJobs(ctx);
 			const details = { jobId: params.jobId, found: true, cancelled: true };
@@ -255,6 +258,7 @@ export default function (pi: ExtensionAPI) {
 		if (isOnce) {
 			jobs.delete(job.jobId);
 			firingJobs.set(job.jobId, job);
+			updateStatus(job.context, jobs.size);
 			job.cron.stop();
 			await writeJobs(job.context);
 			if (!job.active) {
@@ -555,6 +559,15 @@ function toolResult<T>(text: string, details: T) {
 
 function notify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error"): void {
 	if (ctx.hasUI) ctx.ui.notify(message, type);
+}
+
+function updateStatus(ctx: ExtensionContext, jobCount: number): void {
+	if (!ctx.hasUI) return;
+	const text =
+		jobCount === 0
+			? undefined
+			: `${ctx.ui.theme.fg("accent", "runner")} ${ctx.ui.theme.fg("success", `${jobCount} job${jobCount === 1 ? "" : "s"}`)}`;
+	ctx.ui.setStatus("runner", text);
 }
 
 function describeError(error: unknown): string {

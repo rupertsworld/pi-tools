@@ -35,9 +35,14 @@ interface StubCtx {
 	ctx: {
 		hasUI: boolean;
 		sessionManager: { getSessionId: () => string };
-		ui: { notify: (message: string, type?: string) => void };
+		ui: {
+			notify: (message: string, type?: string) => void;
+			setStatus: (key: string, text: string | undefined) => void;
+			theme: { fg: (color: string, text: string) => string };
+		};
 	};
 	notifications: Array<{ message: string; type?: string }>;
+	statusCalls: Array<{ key: string; text: string | undefined }>;
 }
 
 interface ScheduledJob {
@@ -73,6 +78,22 @@ afterEach(async () => {
 });
 
 describe("runner tools", () => {
+	it("updates the status with singular and plural job counts after scheduling", async () => {
+		await runTool("schedule", {
+			trigger: { kind: "cron", cron: "0 * * * * *" },
+			action: { kind: "prompt", message: "First" },
+		});
+		await runTool("schedule", {
+			trigger: { kind: "cron", cron: "0 * * * * *" },
+			action: { kind: "prompt", message: "Second" },
+		});
+
+		assert.deepEqual(stubCtx.statusCalls, [
+			{ key: "runner", text: "<accent:runner> <success:1 job>" },
+			{ key: "runner", text: "<accent:runner> <success:2 jobs>" },
+		]);
+	});
+
 	it("schedules and lists a valid recurring cron prompt", async () => {
 		const before = Date.now();
 		const scheduled = await runTool("schedule", {
@@ -282,6 +303,7 @@ describe("runner tools", () => {
 
 		assert.deepEqual((await runTool("list", {})).details, []);
 		assert.deepEqual(readPersistedJobs(), []);
+		assert.deepEqual(stubCtx.statusCalls.at(-1), { key: "runner", text: undefined });
 	});
 
 	it("keeps a cron prompt active after firing", async () => {
@@ -315,6 +337,7 @@ describe("runner tools", () => {
 		assert.deepEqual((await runTool("list", {})).details, []);
 		assert.equal(stub.sendMessageCalls.length, 0);
 		assert.deepEqual(readPersistedJobs(), []);
+		assert.deepEqual(stubCtx.statusCalls.at(-1), { key: "runner", text: undefined });
 	});
 
 	it("reports an unknown cancellation without throwing", async () => {
@@ -323,6 +346,18 @@ describe("runner tools", () => {
 		assert.equal(result.isError, undefined);
 		assert.deepEqual(result.details, { jobId: "missing", found: false, cancelled: false });
 		assert.deepEqual(readPersistedJobs(), []);
+	});
+
+	it("does not access status UI when the session has no UI", async () => {
+		stubCtx.ctx.hasUI = false;
+
+		const scheduled = await runTool("schedule", {
+			trigger: { kind: "once", at: new Date(Date.now() + 60_000).toISOString() },
+			action: { kind: "prompt", message: "Headless" },
+		});
+		await assert.doesNotReject(scheduledCron(scheduled).trigger());
+
+		assert.deepEqual(stubCtx.statusCalls, []);
 	});
 
 	it("warns and continues when schedules cannot be written", async () => {
@@ -377,6 +412,29 @@ describe("runner tools", () => {
 });
 
 describe("runner lifecycle", () => {
+	it("sets the status after loading persisted jobs on session_start", async () => {
+		writePersistedJobs([
+			{
+				jobId: "persisted-once",
+				action: { kind: "prompt", message: "Loaded reminder" },
+				deliverAs: "followUp",
+				trigger: { kind: "once", at: new Date(Date.now() + 60_000).toISOString() },
+			},
+			{
+				jobId: "persisted-cron",
+				action: { kind: "prompt", message: "Loaded recurring prompt" },
+				deliverAs: "followUp",
+				trigger: { kind: "cron", cron: "0 * * * * *" },
+			},
+		]);
+
+		await fireEvent("session_start");
+
+		assert.deepEqual(stubCtx.statusCalls, [
+			{ key: "runner", text: "<accent:runner> <success:2 jobs>" },
+		]);
+	});
+
 	it("normalizes legacy persisted jobs on session_start", async () => {
 		const definitions = [
 			{
@@ -566,6 +624,7 @@ function createStubPi(): StubPi {
 
 function createStubCtx(): StubCtx {
 	const notifications: StubCtx["notifications"] = [];
+	const statusCalls: StubCtx["statusCalls"] = [];
 	return {
 		ctx: {
 			hasUI: true,
@@ -578,9 +637,18 @@ function createStubCtx(): StubCtx {
 				notify(message, type) {
 					notifications.push({ message, type });
 				},
+				setStatus(key, text) {
+					statusCalls.push({ key, text });
+				},
+				theme: {
+					fg(color, text) {
+						return `<${color}:${text}>`;
+					},
+				},
 			},
 		},
 		notifications,
+		statusCalls,
 	};
 }
 
