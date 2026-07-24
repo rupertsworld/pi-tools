@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, Server } from "node:http";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
@@ -20,10 +20,15 @@ interface StubPi {
 }
 
 interface StubCtx {
-	ctx: { hasUI: boolean; ui: { notify: (message: string, type?: string) => void } };
+	ctx: {
+		hasUI: boolean;
+		sessionManager: { getSessionId: () => string };
+		ui: { notify: (message: string, type?: string) => void };
+	};
 	notifications: Array<{ message: string; type?: string }>;
 }
 
+const sessionId = "test-session";
 let agentDir: string;
 let previousAgentDirEnv: string | undefined;
 let stub: StubPi;
@@ -47,177 +52,215 @@ afterEach(async () => {
 });
 
 describe("webhook lifecycle", () => {
-	it("does not listen or touch webhook.json before /webhook start", async () => {
-		const handler = stub.handlers.get("session_start");
-		if (handler) await handler({}, createStubCtx().ctx);
+	it("does not listen or create config before an explicit attach", async () => {
+		await fireEvent("session_start", createStubCtx());
 
 		assert.equal(await fileExists(join(agentDir, "webhook.json")), false);
 		assert.match(await commandStatus(), /not running/i);
+		assert.match(await commandStatus(), /not attached/i);
 	});
 
-	it("creates webhook.json with defaults on first /webhook start when missing", async () => {
-		await runCommand("start 0");
-
-		const config = JSON.parse(await readFile(join(agentDir, "webhook.json"), "utf8")) as unknown;
-		assert.deepEqual(config, { bind: "127.0.0.1", port: 3729 });
-	});
-
-	it("does not overwrite an existing webhook.json on start", async () => {
-		const existing = "{\n\t\"bind\": \"127.0.0.1\",\n\t\"port\": 0\n}\n";
-		await writeFile(join(agentDir, "webhook.json"), existing, "utf8");
-
-		await runCommand("start");
-
-		assert.equal(await readFile(join(agentDir, "webhook.json"), "utf8"), existing);
-	});
-
-	it("warns and falls back to defaults on a malformed webhook.json without overwriting it", async () => {
-		const malformed = "not json {{";
-		await writeFile(join(agentDir, "webhook.json"), malformed, "utf8");
-
-		const notifications = await runCommand("start 0");
-
-		assert.equal(await readFile(join(agentDir, "webhook.json"), "utf8"), malformed);
-		assert.ok(
-			notifications.some((entry) => entry.type === "warning" && /webhook\.json/.test(entry.message)),
-			JSON.stringify(notifications),
-		);
-		assert.match(await commandStatus(), /listening/i);
-	});
-
-	it("starts on the configured bind and port via /webhook start", async () => {
+	it("attaches the current session, writes config, and serves requests", async () => {
 		const address = await startOnEphemeralPort();
 
-		assert.match(address, /^http:\/\/127\.0\.0\.1:\d+$/);
+		assert.deepEqual(await readConfig(), {
+			bind: "127.0.0.1",
+			port: 0,
+			allowedOrigins: [],
+			sessionId,
+		});
+		const response = await fetch(`${address}/message`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ message: "attached" }),
+		});
+		assert.equal(response.status, 202);
+	});
+
+	it("creates defaults with allowedOrigins and updates a supplied port in webhook.json", async () => {
+		await runCommand("attach 0");
+
+		assert.deepEqual(await readConfig(), {
+			bind: "127.0.0.1",
+			port: 0,
+			allowedOrigins: [],
+			sessionId,
+		});
 		assert.match(await commandStatus(), /listening/i);
 	});
 
-	it("overrides the configured port with an integer argument to start", async () => {
-		const blocker = createServer();
-		const takenPort = await listenOnEphemeralPort(blocker);
-		try {
-			await writeConfig({ bind: "127.0.0.1", port: takenPort });
+	it("rejects invalid ports without changing config or starting", async () => {
+		const existing = "{\n\t\"bind\": \"127.0.0.1\",\n\t\"port\": 0,\n\t\"allowedOrigins\": []\n}\n";
+		await writeFile(join(agentDir, "webhook.json"), existing, "utf8");
 
-			const notifications = await runCommand("start 0");
-
-			const status = await commandStatus();
-			assert.match(status, /listening/i);
-			const match = status.match(/http:\/\/127\.0\.0\.1:(\d+)/);
-			assert.ok(match, status);
-			assert.notEqual(Number(match![1]), takenPort);
-			assert.ok(
-				notifications.every((entry) => entry.type !== "error"),
-				JSON.stringify(notifications),
-			);
-		} finally {
-			blocker.close();
+		for (const port of ["abc", "70000"]) {
+			const notifications = await runCommand(`attach ${port}`);
+			assert.ok(notifications.some((entry) => entry.type === "error" && /port/i.test(entry.message)));
 		}
-	});
 
-	it("rejects a non-integer port argument without starting", async () => {
-		const notifications = await runCommand("start abc");
-
-		assert.ok(
-			notifications.some((entry) => entry.type === "error" && /port/i.test(entry.message)),
-			JSON.stringify(notifications),
-		);
+		assert.equal(await readFile(join(agentDir, "webhook.json"), "utf8"), existing);
 		assert.match(await commandStatus(), /not running/i);
 	});
 
-	it("rejects an out-of-range port argument without starting", async () => {
-		const notifications = await runCommand("start 70000");
-
-		assert.ok(
-			notifications.some((entry) => entry.type === "error" && /port/i.test(entry.message)),
-			JSON.stringify(notifications),
+	it("warns and falls back to defaults when allowedOrigins is invalid", async () => {
+		await writeFile(
+			join(agentDir, "webhook.json"),
+			JSON.stringify({ bind: "127.0.0.1", port: 4321, allowedOrigins: "https://app.example" }),
+			"utf8",
 		);
-		assert.match(await commandStatus(), /not running/i);
+
+		const notifications = await runCommand("attach 0");
+
+		assert.ok(notifications.some((entry) => entry.type === "warning" && /webhook\.json/.test(entry.message)));
+		assert.deepEqual(await readConfig(), {
+			bind: "127.0.0.1",
+			port: 0,
+			allowedOrigins: [],
+			sessionId,
+		});
 	});
 
-	it("notifies and continues without the webhook when the port is taken", async () => {
+	it("warns and replaces malformed config with attach-time defaults and ownership", async () => {
+		await writeFile(join(agentDir, "webhook.json"), "not json {{", "utf8");
+
+		const notifications = await runCommand("attach 0");
+
+		assert.ok(notifications.some((entry) => entry.type === "warning" && /webhook\.json/.test(entry.message)));
+		assert.deepEqual(await readConfig(), {
+			bind: "127.0.0.1",
+			port: 0,
+			allowedOrigins: [],
+			sessionId,
+		});
+	});
+
+	it("transfers ownership even when the configured port is already taken", async () => {
 		const blocker = createServer();
 		const port = await listenOnEphemeralPort(blocker);
 		try {
-			await writeConfig({ bind: "127.0.0.1", port });
+			await writeConfig({ bind: "127.0.0.1", port, allowedOrigins: [] });
 
-			const notifications = await runCommand("start");
+			const notifications = await runCommand("attach");
 
-			assert.ok(
-				notifications.some((entry) => entry.type === "error" && /webhook/i.test(entry.message)),
-				JSON.stringify(notifications),
-			);
+			assert.ok(notifications.some((entry) =>
+				entry.type === "error" && /another session/i.test(entry.message) && /shutdown|detach/i.test(entry.message),
+			), JSON.stringify(notifications));
+			assert.equal((await readConfig()).sessionId, sessionId);
 			assert.match(await commandStatus(), /not running/i);
 		} finally {
-			blocker.close();
+			await new Promise<void>((resolve) => blocker.close(() => resolve()));
 		}
 	});
 
-	it("keeps the running server when start is repeated", async () => {
+	it("keeps serving and refreshes ownership on repeated attach", async () => {
 		const address = await startOnEphemeralPort();
+		await writeConfig({ bind: "127.0.0.1", port: 0, allowedOrigins: [], sessionId: "someone-else" });
 
-		const notifications = await runCommand("start");
+		const notifications = await runCommand("attach");
 
-		assert.ok(
-			notifications.some((entry) => /already/i.test(entry.message)),
-			JSON.stringify(notifications),
-		);
-		const status = await commandStatus();
-		assert.ok(status.includes(address), `${status} should include ${address}`);
+		assert.equal((await readConfig()).sessionId, sessionId);
+		assert.ok(notifications.some((entry) => entry.message.includes(address)), JSON.stringify(notifications));
+		assert.ok((await commandStatus()).includes(address));
 	});
 
-	it("stops the server via /webhook stop", async () => {
-		const address = await startOnEphemeralPort();
+	it("detach stops the server and removes sessionId while preserving user config", async () => {
+		await writeConfig({ bind: "127.0.0.1", port: 0, allowedOrigins: ["https://app.example"] });
+		await runCommand("attach");
+		const address = statusAddress(await commandStatus());
 
-		const notifications = await runCommand("stop");
+		await runCommand("detach");
 
-		assert.ok(
-			notifications.some((entry) => /stopped/i.test(entry.message)),
-			JSON.stringify(notifications),
-		);
 		await assert.rejects(fetch(`${address}/message`, { method: "POST", body: "{}" }));
-		assert.match(await commandStatus(), /not running/i);
+		assert.deepEqual(await readConfig(), {
+			bind: "127.0.0.1",
+			port: 0,
+			allowedOrigins: ["https://app.example"],
+		});
+		assert.match(await commandStatus(), /not attached/i);
 	});
 
-	it("reports not running when stop is invoked without a server", async () => {
-		const notifications = await runCommand("stop");
+	it("detach clears ownership even when this session is not serving", async () => {
+		await writeConfig({ bind: "127.0.0.1", port: 0, allowedOrigins: [], sessionId: "someone-else" });
+
+		const notifications = await runCommand("detach");
+
+		assert.equal((await readConfig()).sessionId, undefined);
+		assert.ok(notifications.some((entry) => /not running|detached/i.test(entry.message)), JSON.stringify(notifications));
+	});
+
+	it("does not report a successful detach when config ownership cannot be cleared", async () => {
+		await rm(join(agentDir, "webhook.json"), { force: true });
+		await mkdir(join(agentDir, "webhook.json"));
+
+		const notifications = await runCommand("detach");
 
 		assert.ok(
-			notifications.some((entry) => /not running/i.test(entry.message)),
+			notifications.some((entry) => entry.type === "error" && /could not (?:be )?clear|not cleared/i.test(entry.message)),
+			JSON.stringify(notifications),
+		);
+		assert.ok(
+			notifications.every((entry) => !/^Webhook detached\b/i.test(entry.message)),
 			JSON.stringify(notifications),
 		);
 	});
 
-	it("notifies usage for an unknown subcommand", async () => {
-		const notifications = await runCommand("frobnicate");
+	it("session_start serves only when the configured sessionId matches", async () => {
+		await writeConfig({ bind: "127.0.0.1", port: 0, allowedOrigins: [], sessionId });
 
-		assert.ok(
-			notifications.some((entry) => /usage/i.test(entry.message)),
-			JSON.stringify(notifications),
-		);
-		assert.match(await commandStatus(), /not running/i);
+		await fireEvent("session_start", createStubCtx());
+
+		const response = await fetch(`${statusAddress(await commandStatus())}/message`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ message: "restored" }),
+		});
+		assert.equal(response.status, 202);
 	});
 
-	it("reports status via the status subcommand and the bare command", async () => {
-		assert.match(await commandStatus(), /not running/i);
-		const [statusNotification] = await runCommand("status");
-		assert.match(statusNotification!.message, /not running/i);
-
-		const address = await startOnEphemeralPort();
-
-		const status = await commandStatus();
-		assert.match(status, /listening/i);
-		assert.ok(status.includes(address), `${status} should include ${address}`);
-		const [runningStatus] = await runCommand("status");
-		assert.ok(runningStatus!.message.includes(address), runningStatus!.message);
+	it("session_start does nothing for different or absent ownership", async () => {
+		for (const configuredSessionId of ["someone-else", undefined]) {
+			await writeConfig({ bind: "127.0.0.1", port: 0, allowedOrigins: [], sessionId: configuredSessionId });
+			await fireEvent("session_start", createStubCtx());
+			assert.match(await commandStatus(), /not running/i);
+		}
 	});
 
-	it("closes the server on session_shutdown", async () => {
+	it("session_start warns and does not serve malformed or invalid-session config", async () => {
+		for (const config of ["not json {{", JSON.stringify({ bind: "127.0.0.1", port: 0, sessionId: 42 })]) {
+			await writeFile(join(agentDir, "webhook.json"), config, "utf8");
+			const ctx = createStubCtx();
+			await assert.doesNotReject(fireEvent("session_start", ctx));
+			assert.ok(ctx.notifications.some((entry) => entry.type === "warning" && /webhook\.json/.test(entry.message)));
+			const statusNotifications = await runCommand("status");
+			assert.match(statusNotifications.at(-1)!.message, /not running/i);
+		}
+	});
+
+	it("session_shutdown stops serving but leaves ownership in config", async () => {
 		const address = await startOnEphemeralPort();
 
 		await fireEvent("session_shutdown", createStubCtx());
 
 		await assert.rejects(fetch(`${address}/message`, { method: "POST", body: "{}" }));
-		assert.match(await commandStatus(), /not running/i);
+		assert.equal((await readConfig()).sessionId, sessionId);
+	});
+
+	it("status and bare command report the configured attached session", async () => {
+		await writeConfig({ bind: "127.0.0.1", port: 0, allowedOrigins: [], sessionId: "attached-session" });
+
+		for (const command of ["", "status"]) {
+			const [notification] = await runCommand(command);
+			assert.match(notification!.message, /attached-session/);
+			assert.match(notification!.message, /not running/i);
+		}
+	});
+
+	it("uses the attach usage line for unknown commands, including old start and stop", async () => {
+		const usage = "Usage: /webhook attach [port] | detach | status";
+		for (const command of ["frobnicate", "start", "stop"]) {
+			const notifications = await runCommand(command);
+			assert.equal(notifications[0]?.message, usage);
+		}
 	});
 
 	it("notifies without crashing when the server errors after a successful listen", async (t) => {
@@ -232,7 +275,7 @@ describe("webhook lifecycle", () => {
 		});
 
 		await writeConfig({ bind: "127.0.0.1", port: 0 });
-		const notifications = await runCommand("start");
+		const notifications = await runCommand("attach");
 		assert.equal(created.length, 1);
 
 		created[0]!.emit("error", new Error("boom"));
@@ -315,7 +358,7 @@ describe("webhook http handling", () => {
 		assert.equal(stub.sendMessageCalls.length, 0);
 	});
 
-	it("rejects a request bearing an Origin header with 403 without injecting", async () => {
+	it("rejects an origin when the allowlist is empty with 403 without injecting", async () => {
 		const address = await startOnEphemeralPort();
 
 		const response = await fetch(`${address}/message`, {
@@ -328,6 +371,108 @@ describe("webhook http handling", () => {
 		const payload = (await response.json()) as { ok: boolean };
 		assert.equal(payload.ok, false);
 		assert.equal(stub.sendMessageCalls.length, 0);
+	});
+
+	it("allows an origin in the allowlist and echoes it on the response", async () => {
+		const origin = "https://App.Example";
+		const address = await startOnEphemeralPort(["https://app.example"]);
+
+		const response = await fetch(`${address}/message`, {
+			method: "POST",
+			headers: { "content-type": "application/json", origin },
+			body: JSON.stringify({ message: "allowed" }),
+		});
+
+		assert.equal(response.status, 202);
+		assert.equal(response.headers.get("access-control-allow-origin"), origin);
+		assert.deepEqual(stub.sendMessageCalls, [
+			{
+				message: { customType: "webhook", content: "allowed", display: true },
+				options: { triggerTurn: true, deliverAs: "followUp" },
+			},
+		]);
+	});
+
+	it("allows any origin when the allowlist contains a wildcard", async () => {
+		const address = await startOnEphemeralPort(["*"]);
+
+		const response = await fetch(`${address}/message`, {
+			method: "POST",
+			headers: { "content-type": "application/json", origin: "https://anything.example" },
+			body: JSON.stringify({ message: "wildcard" }),
+		});
+
+		assert.equal(response.status, 202);
+		assert.equal(response.headers.get("access-control-allow-origin"), "*");
+		assert.equal(stub.sendMessageCalls.length, 1);
+	});
+
+	it("rejects an origin not in a non-empty allowlist without injecting", async () => {
+		const address = await startOnEphemeralPort(["https://allowed.example"]);
+
+		const response = await fetch(`${address}/message`, {
+			method: "POST",
+			headers: { "content-type": "application/json", origin: "https://other.example" },
+			body: JSON.stringify({ message: "blocked" }),
+		});
+
+		assert.equal(response.status, 403);
+		assert.equal(response.headers.get("access-control-allow-origin"), null);
+		assert.equal(stub.sendMessageCalls.length, 0);
+	});
+
+	it("allows requests without an Origin regardless of the allowlist", async () => {
+		const address = await startOnEphemeralPort(["https://allowed.example"]);
+
+		const response = await fetch(`${address}/message`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ message: "non-browser" }),
+		});
+
+		assert.equal(response.status, 202);
+		assert.equal(response.headers.get("access-control-allow-origin"), null);
+		assert.equal(stub.sendMessageCalls.length, 1);
+	});
+
+	it("answers an allowlisted OPTIONS preflight with CORS headers", async () => {
+		const origin = "https://app.example";
+		const address = await startOnEphemeralPort([origin]);
+
+		const response = await fetch(`${address}/message`, {
+			method: "OPTIONS",
+			headers: { origin },
+		});
+
+		assert.equal(response.status, 204);
+		assert.equal(response.headers.get("access-control-allow-origin"), origin);
+		assert.equal(response.headers.get("access-control-allow-methods"), "POST");
+		assert.equal(response.headers.get("access-control-allow-headers"), "content-type");
+		assert.equal(response.headers.get("access-control-max-age"), "600");
+		assert.equal(stub.sendMessageCalls.length, 0);
+	});
+
+	it("rejects OPTIONS preflights from non-allowlisted or missing origins", async () => {
+		const address = await startOnEphemeralPort(["https://allowed.example"]);
+
+		for (const origin of ["https://other.example", undefined]) {
+			const headers = origin === undefined ? undefined : { origin };
+			const response = await fetch(`${address}/message`, { method: "OPTIONS", headers });
+			assert.equal(response.status, 403);
+		}
+
+		assert.equal(stub.sendMessageCalls.length, 0);
+	});
+
+	it("responds 404 to OPTIONS on other paths", async () => {
+		const address = await startOnEphemeralPort(["*"]);
+
+		const response = await fetch(`${address}/other`, {
+			method: "OPTIONS",
+			headers: { origin: "https://app.example" },
+		});
+
+		assert.equal(response.status, 404);
 	});
 
 	it("rejects a non-JSON Content-Type with 415 without injecting", async () => {
@@ -370,6 +515,7 @@ describe("webhook http handling", () => {
 
 		const wrongMethod = await fetch(`${address}/message`);
 		assert.equal(wrongMethod.status, 405);
+		assert.equal(wrongMethod.headers.get("allow"), "POST, OPTIONS");
 
 		assert.equal(stub.sendMessageCalls.length, 0);
 	});
@@ -398,6 +544,7 @@ function createStubCtx(): StubCtx {
 	return {
 		ctx: {
 			hasUI: true,
+			sessionManager: { getSessionId: () => sessionId },
 			ui: {
 				notify(message: string, type?: string) {
 					notifications.push({ message, type });
@@ -429,8 +576,17 @@ async function commandStatus(): Promise<string> {
 	return notifications[0]!.message;
 }
 
-async function writeConfig(config: { bind: string; port: number }): Promise<void> {
+async function writeConfig(config: { bind: string; port: number; allowedOrigins?: string[]; sessionId?: string }): Promise<void> {
 	await writeFile(join(agentDir, "webhook.json"), JSON.stringify(config), "utf8");
+}
+
+async function readConfig(): Promise<{ bind: string; port: number; allowedOrigins: string[]; sessionId?: string }> {
+	return JSON.parse(await readFile(join(agentDir, "webhook.json"), "utf8")) as {
+		bind: string;
+		port: number;
+		allowedOrigins: string[];
+		sessionId?: string;
+	};
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -453,11 +609,15 @@ function listenOnEphemeralPort(server: Server): Promise<number> {
 	});
 }
 
-async function startOnEphemeralPort(): Promise<string> {
-	await writeConfig({ bind: "127.0.0.1", port: 0 });
-	await runCommand("start");
+async function startOnEphemeralPort(allowedOrigins: string[] = []): Promise<string> {
+	await writeConfig({ bind: "127.0.0.1", port: 0, allowedOrigins });
+	await runCommand("attach");
 
 	const status = await commandStatus();
+	return statusAddress(status);
+}
+
+function statusAddress(status: string): string {
 	const match = status.match(/http:\/\/127\.0\.0\.1:(\d+)/);
 	assert.ok(match, `expected listening address in: ${status}`);
 	return `http://127.0.0.1:${match[1]}`;

@@ -1,8 +1,8 @@
 /**
  * Webhook extension: HTTP ingress for injecting messages into the active session.
  *
- * Nothing listens until /webhook start; /webhook stop stops the server, and
- * session_shutdown always closes it. POST /message with {"message": "..."}
+ * Nothing listens until a session attaches or resumes its attachment;
+ * session_shutdown always closes the server. POST /message with {"message": "..."}
  * injects the message into the session via pi.sendMessage. Configuration lives
  * in webhook.json in the coding-agent home. See SPEC.md.
  */
@@ -17,35 +17,43 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 interface WebhookConfig {
 	bind: string;
 	port: number;
+	allowedOrigins: string[];
+	sessionId?: string;
 }
 
-const DEFAULT_CONFIG: WebhookConfig = { bind: "127.0.0.1", port: 3729 };
+const DEFAULT_CONFIG: WebhookConfig = { bind: "127.0.0.1", port: 3729, allowedOrigins: [] };
 const MAX_BODY_BYTES = 1_048_576;
 
 class BodyTooLargeError extends Error {}
 
-const USAGE = "Usage: /webhook start [port] | stop | status";
+const USAGE = "Usage: /webhook attach [port] | detach | status";
 
 export default function (pi: ExtensionAPI) {
 	let server: Server | undefined;
+
+	pi.on("session_start", async (_event, ctx) => {
+		const config = await loadConfig(ctx, false, false);
+		if (config?.sessionId !== ctx.sessionManager.getSessionId()) return;
+		server = await startServer(config, ctx);
+	});
 
 	pi.on("session_shutdown", async () => {
 		await stopServer();
 	});
 
 	pi.registerCommand("webhook", {
-		description: "Control the webhook server: start [port] | stop | status",
+		description: "Control the webhook server: attach [port] | detach | status",
 		handler: async (args, ctx) => {
 			const [subcommand, portArg] = args.trim().split(/\s+/).filter((part) => part.length > 0);
 			switch (subcommand ?? "status") {
-				case "start":
-					await handleStart(portArg, ctx);
+				case "attach":
+					await handleAttach(portArg, ctx);
 					return;
-				case "stop":
-					await handleStop(ctx);
+				case "detach":
+					await handleDetach(ctx);
 					return;
 				case "status":
-					notify(ctx, statusMessage(), "info");
+					notify(ctx, await statusMessage(ctx), "info");
 					return;
 				default:
 					notify(ctx, USAGE, "info");
@@ -53,51 +61,66 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	async function handleStart(portArg: string | undefined, ctx: ExtensionContext): Promise<void> {
-		if (server) {
-			notify(ctx, `Webhook already running. ${statusMessage()}`, "info");
-			return;
-		}
-		let portOverride: number | undefined;
+	async function handleAttach(portArg: string | undefined, ctx: ExtensionContext): Promise<void> {
+		let requestedPort: number | undefined;
 		if (portArg !== undefined) {
-			portOverride = parsePort(portArg);
-			if (portOverride === undefined) {
+			requestedPort = parsePort(portArg);
+			if (requestedPort === undefined) {
 				notify(ctx, `Invalid port "${portArg}". ${USAGE}`, "error");
 				return;
 			}
 		}
-		const config = await loadConfig(ctx);
-		if (portOverride !== undefined) config.port = portOverride;
-		server = await startServer(config, ctx);
-		if (server) notify(ctx, statusMessage(), "info");
-	}
-
-	async function handleStop(ctx: ExtensionContext): Promise<void> {
-		if (!server) {
-			notify(ctx, "Webhook not running.", "info");
+		const config = await loadConfig(ctx, true, true);
+		if (!config) return;
+		if (requestedPort !== undefined) config.port = requestedPort;
+		config.sessionId = ctx.sessionManager.getSessionId();
+		if (!(await writeConfig(config, ctx))) return;
+		if (server) {
+			notify(ctx, await statusMessage(ctx), "info");
 			return;
 		}
-		await stopServer();
-		notify(ctx, "Webhook stopped.", "info");
+		server = await startServer(config, ctx);
+		if (server) notify(ctx, await statusMessage(ctx), "info");
 	}
 
-	function statusMessage(): string {
+	async function handleDetach(ctx: ExtensionContext): Promise<void> {
+		const wasRunning = server !== undefined;
+		await stopServer();
+		const config = await loadConfig(ctx, false, true);
+		if (config) {
+			delete config.sessionId;
+			if (!(await writeConfig(config, ctx))) {
+				notify(ctx, "Webhook stopped here, but its configured attachment could not be cleared.", "error");
+				return;
+			}
+		}
+		notify(ctx, wasRunning ? "Webhook detached and stopped." : "Webhook detached; it was not running here.", "info");
+	}
+
+	async function statusMessage(ctx: ExtensionContext): Promise<string> {
+		const config = await loadConfig(ctx, false, false);
+		const attachment = config?.sessionId ? `Attached session: ${config.sessionId}.` : "Not attached.";
 		const address = server?.address();
-		if (!address || typeof address !== "object") return "Webhook not running. Start with /webhook start.";
+		if (!address || typeof address !== "object") return `Webhook not running. ${attachment}`;
 		const base = `http://${address.address}:${address.port}`;
-		return `Webhook listening at ${base} — send: curl -X POST ${base}/message -d '{"message":"..."}'`;
+		return `Webhook listening at ${base}. ${attachment} Send: curl -X POST ${base}/message -H 'Content-Type: application/json' -d '{"message":"..."}'`;
 	}
 
 	function startServer(config: WebhookConfig, ctx: ExtensionContext): Promise<Server | undefined> {
 		return new Promise((resolve) => {
 			const candidate = createServer((request, response) => {
-				handleRequest(request, response).catch(() => {
+				handleRequest(request, response, config).catch(() => {
 					if (!response.headersSent) sendJson(response, 500, { ok: false, error: "internal error" });
 					else response.destroy();
 				});
 			});
 			const onBindError = (error: Error) => {
-				notify(ctx, `Webhook failed to listen on ${config.bind}:${config.port} (${error.message}). Continuing without webhook.`, "error");
+				candidate.close();
+				notify(
+					ctx,
+					`Webhook failed to listen on ${config.bind}:${config.port} (${error.message}). Another session may still hold the port; it releases on shutdown or /webhook detach. Continuing without webhook.`,
+					"error",
+				);
 				resolve(undefined);
 			};
 			candidate.once("error", onBindError);
@@ -121,21 +144,38 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+	async function handleRequest(request: IncomingMessage, response: ServerResponse, config: WebhookConfig): Promise<void> {
 		const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
 		if (pathname !== "/message") {
 			sendJson(response, 404, { ok: false, error: "not found" });
 			return;
 		}
+		const origin = request.headers.origin;
+		const allowedOrigin = origin === undefined ? undefined : matchAllowedOrigin(origin, config.allowedOrigins);
+		if (request.method === "OPTIONS") {
+			if (allowedOrigin === undefined) {
+				sendJson(response, 403, { ok: false, error: "origin is not allowed" });
+				return;
+			}
+			response.writeHead(204, {
+				"access-control-allow-origin": allowedOrigin,
+				"access-control-allow-methods": "POST",
+				"access-control-allow-headers": "content-type",
+				"access-control-max-age": "600",
+			});
+			response.end();
+			return;
+		}
 		if (request.method !== "POST") {
-			response.setHeader("allow", "POST");
+			response.setHeader("allow", "POST, OPTIONS");
 			sendJson(response, 405, { ok: false, error: "method not allowed" });
 			return;
 		}
-		if (request.headers.origin !== undefined) {
-			sendJson(response, 403, { ok: false, error: "browser requests are not allowed" });
+		if (origin !== undefined && allowedOrigin === undefined) {
+			sendJson(response, 403, { ok: false, error: "origin is not allowed" });
 			return;
 		}
+		if (allowedOrigin !== undefined) response.setHeader("access-control-allow-origin", allowedOrigin);
 		if (!isJsonContentType(request.headers["content-type"])) {
 			sendJson(response, 415, { ok: false, error: "content-type must be application/json" });
 			return;
@@ -175,7 +215,11 @@ export default function (pi: ExtensionAPI) {
 	}
 }
 
-async function loadConfig(ctx: ExtensionContext): Promise<WebhookConfig> {
+async function loadConfig(
+	ctx: ExtensionContext,
+	createIfMissing: boolean,
+	fallbackOnInvalid: boolean,
+): Promise<WebhookConfig | undefined> {
 	const configPath = join(getAgentDir(), "webhook.json");
 
 	let raw: string;
@@ -183,23 +227,33 @@ async function loadConfig(ctx: ExtensionContext): Promise<WebhookConfig> {
 		raw = await readFile(configPath, "utf8");
 	} catch (error) {
 		if (isErrnoException(error) && error.code === "ENOENT") {
-			try {
-				await writeFile(configPath, `${JSON.stringify(DEFAULT_CONFIG, null, "\t")}\n`, "utf8");
-			} catch (writeError) {
-				notify(ctx, `Webhook could not create ${configPath} (${describeError(writeError)}). Using defaults.`, "warning");
-			}
+			if (!createIfMissing) return undefined;
+			const config = defaultConfig();
+			await writeConfig(config, ctx);
+			return config;
 		} else {
 			notify(ctx, `Webhook could not read ${configPath} (${describeError(error)}). Using defaults.`, "warning");
 		}
-		return { ...DEFAULT_CONFIG };
+		return fallbackOnInvalid ? defaultConfig() : undefined;
 	}
 
 	const config = parseConfig(raw);
 	if (!config) {
 		notify(ctx, `Webhook config ${configPath} is invalid. Using defaults (bind ${DEFAULT_CONFIG.bind}, port ${DEFAULT_CONFIG.port}).`, "warning");
-		return { ...DEFAULT_CONFIG };
+		return fallbackOnInvalid ? defaultConfig() : undefined;
 	}
 	return config;
+}
+
+async function writeConfig(config: WebhookConfig, ctx: ExtensionContext): Promise<boolean> {
+	const configPath = join(getAgentDir(), "webhook.json");
+	try {
+		await writeFile(configPath, `${JSON.stringify(config, null, "\t")}\n`, "utf8");
+		return true;
+	} catch (error) {
+		notify(ctx, `Webhook could not write ${configPath} (${describeError(error)}).`, "error");
+		return false;
+	}
 }
 
 function parseConfig(raw: string): WebhookConfig | undefined {
@@ -211,14 +265,34 @@ function parseConfig(raw: string): WebhookConfig | undefined {
 	}
 	if (typeof parsed !== "object" || parsed === null) return undefined;
 
-	const { bind, port } = parsed as { bind?: unknown; port?: unknown };
+	const { bind, port, allowedOrigins, sessionId } = parsed as {
+		bind?: unknown;
+		port?: unknown;
+		allowedOrigins?: unknown;
+		sessionId?: unknown;
+	};
 	if (bind !== undefined && typeof bind !== "string") return undefined;
 	if (port !== undefined && (typeof port !== "number" || !Number.isInteger(port) || port < 0 || port > 65535)) return undefined;
+	if (allowedOrigins !== undefined && (!Array.isArray(allowedOrigins) || !allowedOrigins.every((origin) => typeof origin === "string"))) {
+		return undefined;
+	}
+	if (sessionId !== undefined && typeof sessionId !== "string") return undefined;
 
 	return {
 		bind: bind ?? DEFAULT_CONFIG.bind,
 		port: port ?? DEFAULT_CONFIG.port,
+		allowedOrigins: allowedOrigins ?? DEFAULT_CONFIG.allowedOrigins,
+		...(sessionId === undefined ? {} : { sessionId }),
 	};
+}
+
+function defaultConfig(): WebhookConfig {
+	return { ...DEFAULT_CONFIG, allowedOrigins: [...DEFAULT_CONFIG.allowedOrigins] };
+}
+
+function matchAllowedOrigin(origin: string, allowedOrigins: string[]): string | undefined {
+	if (allowedOrigins.includes("*")) return "*";
+	return allowedOrigins.some((allowedOrigin) => allowedOrigin.toLowerCase() === origin.toLowerCase()) ? origin : undefined;
 }
 
 function parsePort(raw: string): number | undefined {
