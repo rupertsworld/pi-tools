@@ -39,18 +39,47 @@ describe("runner extension registration", () => {
 			const cases = {
 				schedule: {
 					valid: [
-						{ message: "Morning review", trigger: { kind: "cron", cron: "0 0 9 * * 1-5" } },
 						{
-							message: "Morning review",
-							trigger: { kind: "cron", cron: "0 0 9 * * 1-5", timeZone: "Australia/Sydney" },
+							trigger: { kind: "cron", cron: "0 0 9 * * 1-5" },
+							action: { kind: "prompt", message: "Morning review" },
 						},
-						{ message: "Check the oven", trigger: { kind: "once", at: "+10m" } },
+						{
+							trigger: { kind: "cron", cron: "0 0 9 * * 1-5", timeZone: "Australia/Sydney" },
+							action: { kind: "command", command: "printf hello", cwd: "/tmp" },
+							deliverAs: "nextTurn",
+						},
+						{
+							trigger: { kind: "once", at: "+10m" },
+							action: { kind: "prompt", message: "Check the oven" },
+							deliverAs: "followUp",
+						},
+						{
+							trigger: { kind: "once", at: "+10m" },
+							action: { kind: "command", command: "date" },
+							deliverAs: "steer",
+						},
 					],
 					invalid: [
 						{},
-						{ message: "Missing trigger" },
-						{ message: "Wrong trigger", trigger: { kind: "cron", at: "+10m" } },
-						{ message: "Wrong trigger", trigger: { kind: "once", cron: "0 * * * * *" } },
+						{ trigger: { kind: "once", at: "+10m" } },
+						{ message: "Legacy", trigger: { kind: "once", at: "+10m" } },
+						{
+							trigger: { kind: "once", at: "+10m" },
+							action: { kind: "unknown", message: "No" },
+						},
+						{
+							trigger: { kind: "once", at: "+10m" },
+							action: { kind: "prompt", message: "No" },
+							deliverAs: "later",
+						},
+						{
+							trigger: { kind: "cron", at: "+10m" },
+							action: { kind: "prompt", message: "Wrong trigger" },
+						},
+						{
+							trigger: { kind: "once", cron: "0 * * * * *" },
+							action: { kind: "prompt", message: "Wrong trigger" },
+						},
 					],
 				},
 				cancel: {
