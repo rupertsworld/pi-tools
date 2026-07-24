@@ -1,18 +1,20 @@
 # pi-runner — future work
 
-`SPEC.md` covers what runner does today: schedule **prompts** into the active session (cron / once). This doc holds intended expansions. None are built.
+`SPEC.md` covers what runner does today: `{trigger, action, deliverAs}` jobs with `cron`/`once`/`now` triggers and `prompt`/`command`/`subagent` actions, per-job logs + `peek`, per-session persistence, and rendered per-action tools. This doc holds intended expansions. None are built.
 
 ## More triggers
 
-- **interval** — "every N elapsed time" (`"90m"`, `"45s"`), for periods that don't fit a cron expression. Cron covers wall-clock recurrence ("9am daily"); interval covers arbitrary elapsed durations. Kept out of v1 because the driving use is time-of-day recurrence, which is cron's job.
+- **interval** — "every N elapsed time" (`"90m"`, `"45s"`), for periods that don't fit a cron expression. Cron covers wall-clock recurrence ("9am daily"); interval covers arbitrary elapsed durations. Kept out because the driving use is time-of-day recurrence, which is cron's job.
 
-## More actions
+## Action options
 
-The `{ trigger, action, deliverAs }` model is implemented as specified in `SPEC.md`; `prompt` and `command` are implemented, with delivery in pi's own `sendMessage` vocabulary (`followUp` default / `nextTurn` / `steer`). (A human-only "notify" was considered and rejected — notifying a person is a `prompt` over a real channel or a `command` to a push service, not a delivery mode.) Remaining candidates:
+- Per-command timeout (subagents have `maxMinutes`; commands have no cap).
+- Subagent context options: inherit conversation context, richer tool restriction (`--tools`), session resume of finished children.
+(A human-only "notify" action was considered and rejected — notifying a person is a `prompt` over a real channel or a `command` to a push service, not a delivery mode.)
 
-- **subagent** — spawn a `pi --mode rpc` child that runs a prompt in its own isolated session; steerable while it runs (pi's RPC `steer`); inject its final result on `agent_settled`. A subagent is just a `pi` subprocess — no dependency on pi-subagents.
+## Log rotation
 
-Deferred `command` options: a per-command timeout.
+Job logs (`runner/logs/<jobId>.log`) are append-only with no rotation or size cap. A chatty cron job grows its file indefinitely; add rotation or a per-file cap when it starts to matter.
 
 ## Persistence
 
@@ -24,4 +26,4 @@ A background process that outlives any session, so cron fires even when no pi is
 
 ## Misc
 
-- Tool naming: `schedule` / `cancel` / `list` are generic and may collide with other extensions' tools; consider namespacing.
+- Tool naming: resolved for creators (`prompt`/`process`/`subagent` are distinctive); `cancel`/`steer`/`peek`/`list` remain generic-ish — revisit only if a real collision appears.

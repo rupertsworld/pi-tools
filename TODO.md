@@ -10,12 +10,8 @@ HTTP ingress for injecting messages into the receiving session. Delivery is `fol
 ### pi-dynamic-context — IN PROGRESS
 Per-turn refresh of system prompt + context files, with template variables (`{{DATE}}`, `{{TIME}}`, `{{TZ}}`, `{{AGENT_DIR}}`, `{{CWD}}`). Exact-content substitution via `before_agent_start` (no pi internals, no prompt-layout matching). SPEC written; implementation underway.
 
-### pi-runner — IMPLEMENTED (uncommitted, branch `pi-runner`)
-Scoped to one thing: **schedule prompts to be injected into the active session**. Agent-callable tools `schedule` / `cancel` / `list`; triggers `cron` (6-field, `croner`, timezone-aware) and `once` (relative/ISO); fired prompts inject via `pi.sendMessage(..., {triggerTurn:true, deliverAs:"followUp"})`. Session-scoped, no daemon, in-memory. Full spec in `packages/pi-runner/SPEC.md`; deferred scope in `packages/pi-runner/TODO.md`.
-- Implemented via codex (`gpt-5.6-sol`), test-first. Real TypeBox tool schemas via `@earendil-works/pi-ai` (peer dep). `croner` runtime dep.
-- Tests: 12 pass across 3 suites — unit (stubbed pi) + an **e2e** that loads the extension through a real pi session (`createAgentSession` + `DefaultResourceLoader`) and validates the registered schemas via TypeBox `Value.Check`. Independently verified the e2e catches a plain-object schema regression. `tsc` clean.
-- Invalid cron / invalid timeZone / past one-shot → tool error (SPEC reconciled to match).
-- **Not committed** — awaiting go. Branch `pi-runner` is off `main`.
+### pi-runner — FEATURE-COMPLETE (branch `runner-subagents` awaiting PR)
+Session-scoped job engine: `{trigger, action, deliverAs}` — triggers `cron`/`once`/`now`, actions `prompt`/`command`/`subagent` (lean steerable `pi --mode rpc` children, `maxMinutes` cap), delivery in pi's `sendMessage` vocabulary. Per-action creator tools (`prompt`/`process`/`subagent`) + `cancel`/`steer`/`peek`/`list`, all with house-style rendering. Per-session persistence, full per-job logs (`runner/logs/<jobId>.log`) readable via `peek`, footer chip `runner N scheduled · M running`. 57 tests + real-pi e2e; child RPC protocol proven live. Deferred scope in `packages/pi-runner/TODO.md`.
 
 ### pi-local-first (name TBD) — IDEA (no spec)
 Use pi locally on your own machine, and keep pi state synced to remote machines, so you can move between local and remote and pick up where you left off. Sync mechanism tentative — CRDTs floated for conflict-free merge of concurrently-edited state ("or something").

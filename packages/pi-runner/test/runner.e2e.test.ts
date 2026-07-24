@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
+import { validateToolCall } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 
 import createRunnerExtension from "../index.ts";
@@ -25,7 +26,7 @@ describe("runner extension registration", () => {
 			cwd: process.cwd(),
 			resourceLoader: loader,
 			sessionManager: SessionManager.inMemory(),
-			tools: ["schedule", "cancel", "list"],
+			tools: ["prompt", "process", "subagent", "cancel", "steer", "peek", "list"],
 		});
 
 		try {
@@ -33,58 +34,82 @@ describe("runner extension registration", () => {
 			assert.equal(extensionsResult.extensions.length, 1);
 			assert.deepEqual(
 				session.getAllTools().map((tool) => tool.name),
-				["schedule", "cancel", "list"],
+				["prompt", "process", "subagent", "cancel", "steer", "peek", "list"],
 			);
 
 			const cases = {
-				schedule: {
+				prompt: {
 					valid: [
 						{
+							message: "Morning review",
 							trigger: { kind: "cron", cron: "0 0 9 * * 1-5" },
-							action: { kind: "prompt", message: "Morning review" },
 						},
 						{
-							trigger: { kind: "cron", cron: "0 0 9 * * 1-5", timeZone: "Australia/Sydney" },
-							action: { kind: "command", command: "printf hello", cwd: "/tmp" },
-							deliverAs: "nextTurn",
-						},
-						{
+							message: "Check the oven",
 							trigger: { kind: "once", at: "+10m" },
-							action: { kind: "prompt", message: "Check the oven" },
 							deliverAs: "followUp",
-						},
-						{
-							trigger: { kind: "once", at: "+10m" },
-							action: { kind: "command", command: "date" },
-							deliverAs: "steer",
 						},
 					],
 					invalid: [
 						{},
+						{ message: "Missing trigger" },
 						{ trigger: { kind: "once", at: "+10m" } },
-						{ message: "Legacy", trigger: { kind: "once", at: "+10m" } },
 						{
 							trigger: { kind: "once", at: "+10m" },
-							action: { kind: "unknown", message: "No" },
-						},
-						{
-							trigger: { kind: "once", at: "+10m" },
-							action: { kind: "prompt", message: "No" },
+							message: "No",
 							deliverAs: "later",
 						},
+						{ message: "Wrong trigger", trigger: { kind: "cron", at: "+10m" } },
+						{ message: "Wrong trigger", trigger: { kind: "once", cron: "0 * * * * *" } },
+						{ message: "Wrong trigger", trigger: { kind: "later" } },
+					],
+				},
+				process: {
+					valid: [
+						{ command: "date" },
 						{
-							trigger: { kind: "cron", at: "+10m" },
-							action: { kind: "prompt", message: "Wrong trigger" },
+							command: "printf hello",
+							cwd: "/tmp",
+							trigger: { kind: "cron", cron: "0 0 9 * * 1-5", timeZone: "Australia/Sydney" },
+							deliverAs: "nextTurn",
 						},
+					],
+					invalid: [
+						{},
+						{ trigger: { kind: "now" } },
+						{ command: "date", deliverAs: "later" },
+					],
+				},
+				subagent: {
+					valid: [
+						{ prompt: "Review this" },
 						{
-							trigger: { kind: "once", cron: "0 * * * * *" },
-							action: { kind: "prompt", message: "Wrong trigger" },
+							prompt: "Review this",
+							model: "provider/model",
+							cwd: "/tmp",
+							appendSystemPrompt: "Be concise",
+							maxMinutes: 0.5,
+							trigger: { kind: "now" },
 						},
+					],
+					invalid: [
+						{},
+						{ trigger: { kind: "now" } },
+						{ prompt: "No", maxMinutes: 0 },
+						{ prompt: "No", maxMinutes: -1 },
 					],
 				},
 				cancel: {
 					valid: [{ jobId: "job-123" }],
 					invalid: [{}, { jobId: 123 }],
+				},
+				steer: {
+					valid: [{ jobId: "job-123", message: "Change course" }],
+					invalid: [{}, { jobId: "job-123" }, { jobId: 123, message: "No" }],
+				},
+				peek: {
+					valid: [{ jobId: "job-123" }, { jobId: "job-123", lines: 1 }, { jobId: "job-123", lines: 50 }],
+					invalid: [{}, { jobId: 123 }, { jobId: "../secret" }, { jobId: "..\\secret" }, { jobId: "job-123", lines: 0 }, { jobId: "job-123", lines: -1 }, { jobId: "job-123", lines: 1.5 }],
 				},
 				list: {
 					valid: [{}],
@@ -105,6 +130,16 @@ describe("runner extension registration", () => {
 				for (const value of values.invalid)
 					assert.equal(Value.Check(schema, value), false, `${name} should reject ${JSON.stringify(value)}`);
 			}
+
+			assert.throws(
+				() => validateToolCall(session.state.tools, {
+					type: "toolCall",
+					id: "missing-trigger",
+					name: "prompt",
+					arguments: { message: "This must not execute" },
+				}),
+				/Validation failed for tool "prompt"[\s\S]*trigger/i,
+			);
 		} finally {
 			session.dispose();
 		}

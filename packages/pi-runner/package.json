@@ -1,7 +1,7 @@
 {
 	"name": "@telepath-computer/pi-runner",
 	"version": "0.1.0",
-	"description": "Schedule prompts to be injected into the active pi session, on a cron schedule or at a one-shot time",
+	"description": "Run or schedule prompts, processes, and isolated subagents in the active pi session",
 	"type": "module",
 	"license": "MIT",
 	"repository": {
@@ -24,7 +24,8 @@
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "*",
-		"@earendil-works/pi-coding-agent": "*"
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*"
 	},
 	"publishConfig": {
 		"access": "public"

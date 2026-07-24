@@ -2,7 +2,7 @@
 
 Runner schedules **jobs** in the active pi session. The agent registers a job — a **trigger** (when) paired with an **action** (what) — and when the trigger fires, runner performs the action and routes any result back into the session.
 
-Actions today are **prompt** (inject a message so the current agent acts on it) and **command** (run a shell command and inject its output). This drives recurring, self-directed work: a morning review, a periodic check, an hourly `git fetch`.
+Actions today are **prompt** (inject a message so the current agent acts on it), **command** (run a shell command and inject its output), and **subagent** (run isolated agent work and inject its result). This drives recurring, self-directed work: a morning review, a periodic check, an hourly `git fetch`, or a background investigation.
 
 ## Loading
 
@@ -22,11 +22,13 @@ A job is a **trigger** (when) plus an **action** (what), with an optional **`del
 
 - **cron** — `{ "kind": "cron", "cron": "0 0 9 * * 1-5", "timeZone": "America/Los_Angeles" }`. A 6-field cron expression (`second minute hour day-of-month month day-of-week`), firing repeatedly (`"0 0 9 * * 1-5"` = 9:00am every weekday). `timeZone` (IANA name) is optional and defaults to the host zone; an invalid zone is **rejected** rather than falling back, so a schedule never fires at an unintended wall-clock time. An unparseable expression is rejected.
 - **once** — `{ "kind": "once", "at": "+10m" }`. A single future time: relative (`"+10m"`, `"+2h"`, `"+1d"`) or absolute ISO (`"2026-07-24T09:00:00Z"`). Fires exactly once. A non-future or unparseable time is rejected.
+- **now** — `{ "kind": "now" }`. Fires immediately on registration, once. Useful mainly with the `subagent` action ("go do this in the background right now"); valid with any action. A `now` job is never persisted — it fires and is gone.
 
 ### Actions (what)
 
 - **prompt** — `{ "kind": "prompt", "message": "..." }`. Delivers `message` into the current session.
 - **command** — `{ "kind": "command", "command": "...", "cwd": "..." }`. Runs `command` through a shell, captures its stdout/stderr and exit code, and delivers the result. `cwd` is optional and defaults to the pi process's working directory.
+- **subagent** — `{ "kind": "subagent", "prompt": "...", "model": "...", "cwd": "...", "appendSystemPrompt": "...", "maxMinutes": 30 }`. Spawns a fresh, isolated pi agent (`pi --mode rpc`) that runs `prompt` in its own session, steerable while it runs; its final answer is delivered when it settles. Only `prompt` is required. `model` is a pi model pattern (as for `pi --model`); `cwd` defaults to the pi process's working directory; `appendSystemPrompt` appends to the child's system prompt; `maxMinutes` caps the run — at the deadline the child is killed and whatever final text exists is delivered with a timed-out note. Unset means no cap.
 
 ### Delivery (`deliverAs`)
 
@@ -42,17 +44,42 @@ There is deliberately no human-only "notify" mode: notifying a person is agent w
 
 Jobs are created and managed exclusively by the agent, through tools. There is no human-facing command.
 
-### `schedule`
+Three creator tools, one per action kind. Each returns `{ jobId, trigger, action, deliverAs, nextRunAt }` and takes an optional `deliverAs` (see [Delivery](#delivery-deliveras)). Rejected input (the "rejected" cases in the trigger definitions above) is returned as a tool error rather than silently accepted. The persisted job model stays `{ trigger, action, deliverAs }`; the tools are entry points over it, and the stored action kind for `process` remains `command` (existing persisted jobs load unchanged).
 
-Register a job. Input: a `trigger` (see [Triggers](#triggers-when)) and an `action` (see [Actions](#actions-what)), both required, plus an optional `deliverAs` (see [Delivery](#delivery-deliveras)). Returns `{ jobId, trigger, action, deliverAs, nextRunAt }`. Rejected input (the "rejected" cases in the trigger definitions above) is returned as a tool error rather than silently accepted.
+### `prompt`
+
+Schedule a prompt. Input: `{ message, trigger, deliverAs? }` — `trigger` is **required** (an immediate prompt is pointless; scheduling is the point). Creates a job with action `{ kind: "prompt", message }`.
+
+### `process`
+
+Run or schedule a shell command. Input: `{ command, cwd?, trigger?, deliverAs? }` — `trigger` is optional and **defaults to `{ "kind": "now" }`**, so "run this command" just runs. Creates a job with action `{ kind: "command", ... }`.
+
+### `subagent`
+
+Run or schedule a subagent. Input: `{ prompt, model?, cwd?, appendSystemPrompt?, maxMinutes?, trigger?, deliverAs? }` — `trigger` optional, **defaults to `{ "kind": "now" }`**. Creates a job with action `{ kind: "subagent", ... }`.
 
 ### `cancel`
 
-Stop a job. Input: `{ jobId }`. Returns whether a matching job was found and cancelled.
+Stop a job. Input: `{ jobId }`. Returns whether a matching job was found and cancelled. Cancelling a job whose subagent (or command) is mid-run kills the child.
+
+### `steer`
+
+Redirect a running subagent. Input: `{ jobId, message }`. Forwards `message` to the child over pi's RPC `steer` command (delivered after the child's current tool calls, before its next LLM call). A tool error if the job doesn't exist, isn't a subagent, or isn't currently running.
+
+### `peek`
+
+Read a job's log. Input: `{ jobId, lines? }`, where `jobId` is a non-empty ID without path separators and `lines` is a positive integer — returns the last `lines` lines (default 50) of the job's log file, with details `{ jobId, lines, totalBytes }`. Works while the job is running and after it has finished. Unknown or invalid `jobId`, or a job with no log yet, is a tool error.
 
 ### `list`
 
-List active jobs. Returns an array of `{ jobId, trigger, action, deliverAs, nextRunAt }`.
+List active jobs. Returns an array of `{ jobId, trigger, action, deliverAs, nextRunAt }`. Jobs whose action is currently executing (a running command or subagent) additionally report `running: true` and `startedAt`.
+
+## Tool rendering
+
+All seven tools define `renderCall`/`renderResult` in the house style — accent tool name, muted detail, no raw JSON in the transcript:
+
+- **Calls** render as one line: the tool name plus a compact summary — a ~60-char preview of the prompt/message/command, the trigger as `now` / the relative time / the cron string (+ zone when set), `maxMinutes` when set, jobIds as their first 8 characters. Examples: `subagent · "summarize the last 3 commits" · max 5m`, `process · git fetch --all · cron 0 */15 * * * *`, `steer · a7953fc5 · "focus on pi-tools only"`.
+- **Results** render compact by default and fuller when expanded (pi's expanded rendering option): creators as a one-line confirmation with the short jobId and humanized next run (`· running` for now-jobs); `list` as one line per job (short id, kind, preview, next run, running age) instead of a JSON array; `peek` as the log lines themselves in a muted block; `cancel`/`steer` as one-line confirmations; failures in the error color.
 
 ## Firing
 
@@ -60,6 +87,7 @@ When a trigger fires, runner performs the action and produces a result:
 
 - **prompt** — the result is the `message` itself.
 - **command** — runner runs the command and the result is a message containing the command line, its exit code, and its captured stdout/stderr. The agent receives this result like any other delivered message — command output always feeds back into the session.
+- **subagent** — runner spawns the child, runs the prompt to settlement, and the result is a message containing the child's final assistant text (plus a status line: settled, timed out, or failed). Subagent output always feeds back into the session.
 
 ### Command execution
 
@@ -70,13 +98,32 @@ When a trigger fires, runner performs the action and produces a result:
 - **Truncation** — each stream is capped (8 KiB); over the cap, the tail is kept — errors and summaries live at the end — with a marker noting how many bytes were dropped. The full structured result (command, exit code, truncated streams) also rides in the message `details`.
 - **Lifecycle** — a child still running at `session_shutdown`, or whose job is `cancel`led mid-run, is killed as a process tree (SIGTERM, short grace, SIGKILL). There is no per-command timeout yet; with overlap protection a hung command cannot pile up runs.
 
+### Subagent execution
+
+- **Spawning** — the child is `pi --mode rpc`, spawned like a command child (detached, env inherited, `cwd` from the action). It is deliberately **lean**: `--no-extensions --no-context-files`, so children carry no telegram/webhook/runner extensions (no port fights, no recursive scheduling) and no workspace context beyond what the prompt and `appendSystemPrompt` provide. `model` maps to `--model`. The child shares the coding-agent home, so provider auth works.
+- **Protocol** — newline-delimited JSON over stdin/stdout (pi's RPC mode). Runner sends `{"type":"prompt","message":<prompt>}`, tracks events, and treats `agent_settled` as completion; the result text is the last assistant message of the run. `steer` tool calls forward as `{"type":"steer","message":...}`.
+- **Completion** — on settle, deliver the final text and close the child. On child exit/error before settling, deliver a failure note. On `maxMinutes` expiry, kill the child and deliver whatever assistant text exists with a timed-out note. Delivery is suppressed for cancelled/shutdown children (same as commands).
+- **Overlap** — like commands, cron-scheduled subagents use croner's `protect`: a firing is skipped while the previous run is still going.
+- **Lifecycle** — running children are killed (process tree, SIGTERM → grace → SIGKILL) on `cancel` and `session_shutdown`. A `now`/`once` subagent job leaves the job list when its run finishes (`once` semantics); a cron subagent job stays scheduled.
+
 The result is then delivered via `pi.sendMessage({ customType: "runner", content, display: true }, { deliverAs, triggerTurn })`, where `deliverAs` is the job's delivery mode and `triggerTurn` is `true` for `followUp` and `steer` (pi ignores it for `nextTurn`). Runner does not expose `triggerTurn` as a separate job field: the unbundled combinations are degenerate for a scheduler (a `followUp` that never starts a turn is just a worse `nextTurn`), so each mode carries its only sensible pairing.
 
 A **cron** job fires each time its expression matches, until cancelled. A **once** job fires a single time, then is removed automatically.
 
+## Job logs
+
+Every job appends a full log to `$PI_CODING_AGENT_DIR/runner/logs/<jobId>.log` — plain timestamped text lines, readable by the agent via `peek` and by a human via `cat`:
+
+- **all jobs** — creation with a trigger summary and cancellation.
+- **subagent** — spawn line (model and `cwd` when set), each `tool_execution_start` as a one-liner with the tool name and a compact argument summary, assistant text from `message_end`, steer messages, settle/timeout/failure/kill, and the delivered result.
+- **command** — start line with command and `cwd`, the **full uncapped** stdout/stderr as it streams (delivery still truncates to its 8 KiB tails; the log holds everything), and the exit or kill status.
+- **prompt** — a fired/delivered line, so `peek` is uniform across action kinds.
+
+Each physical line starts with an ISO timestamp. Logs are append-only and never auto-deleted or rotated (rotation is future work — see [TODO.md](TODO.md)). Logging failures warn and continue; they never affect the job itself. To avoid notification spam when a path stays unwritable, runner emits one warning per job on its first failed log write and suppresses later log-write warnings for that job.
+
 ## Status line
 
-Runner shows the current job count in pi's footer status (`ctx.ui.setStatus`): `runner 3 jobs` (`1 job` singular). The `runner` label uses the theme accent color and the count uses the success color, matching the telegram extension's status style. The status updates whenever the count changes — on load at `session_start`, `schedule`, `cancel`, and a `once` job firing — and is **cleared entirely at zero jobs**, so sessions that don't use runner carry no footer noise. Sessions without a UI skip the status (guarded by `ctx.hasUI`).
+Runner shows its state in pi's footer status (`ctx.ui.setStatus`): `runner 3 scheduled`, with ` · 1 running` appended (warning color) while any command or subagent is mid-run. The count covers **scheduled jobs only** (`cron`/`once`) — a running `now` job shows purely as `runner 1 running` with no scheduled count. The `runner` label uses the theme accent color and the count uses the success color, matching the telegram extension's status style. The status updates whenever the counts change — on load at `session_start`, job creation, `cancel`, a `once` job firing, and action start/finish — and is **cleared entirely when nothing is scheduled or running**, so sessions that don't use runner carry no footer noise. Sessions without a UI skip the status (guarded by `ctx.hasUI`).
 
 ## Session scope and persistence
 
@@ -96,4 +143,4 @@ Runner is still session-scoped, not a daemon: jobs only fire while their owning 
 
 ## Status
 
-Scheduling, firing, and per-session persistence are implemented for the generalized `{ trigger, action, deliverAs }` model, including **prompt** and **command** actions and the `followUp`, `nextTurn`, and `steer` delivery modes, with unit and end-to-end tests.
+Everything in this spec is implemented in `index.ts`. Triggers (`cron`, `once`, `now`), actions (`prompt`, `command`, `subagent`), delivery modes, the `steer` and `peek` tools, job logs, running state, persistence, and the status line are covered by unit tests (including a scripted RPC fake child exercising the real pipe/kill paths) and an end-to-end schema test through a real pi session.
