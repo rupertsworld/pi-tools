@@ -70,8 +70,12 @@ describe("runner extension registration", () => {
 						{
 							command: "printf hello",
 							cwd: "/tmp",
-							trigger: { kind: "cron", cron: "0 0 9 * * 1-5", timeZone: "Australia/Sydney" },
+							trigger: { kind: "cron", cron: "0 0 9 * * 1-5" },
 							deliverAs: "nextTurn",
+						},
+						{
+							command: "date",
+							trigger: { kind: "cron", cron: "0 0 9 * * 1-5", timeZone: "Australia/Sydney" },
 						},
 					],
 					invalid: [
@@ -140,6 +144,14 @@ describe("runner extension registration", () => {
 				}),
 				/Validation failed for tool "prompt"[\s\S]*trigger/i,
 			);
+
+			const processSchema = session.getToolDefinition("process")?.parameters;
+			assert.ok(processSchema);
+			const processCronSchema = (processSchema as {
+				properties?: { trigger?: { anyOf?: Array<{ properties?: Record<string, unknown> }> } };
+			}).properties?.trigger?.anyOf?.find((candidate) => candidate.properties?.cron);
+			assert.ok(processCronSchema);
+			assert.equal("timeZone" in (processCronSchema.properties ?? {}), false);
 		} finally {
 			session.dispose();
 		}

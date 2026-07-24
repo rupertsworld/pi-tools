@@ -20,7 +20,7 @@ A job is a **trigger** (when) plus an **action** (what), with an optional **`del
 
 ### Triggers (when)
 
-- **cron** — `{ "kind": "cron", "cron": "0 0 9 * * 1-5", "timeZone": "America/Los_Angeles" }`. A 6-field cron expression (`second minute hour day-of-month month day-of-week`), firing repeatedly (`"0 0 9 * * 1-5"` = 9:00am every weekday). `timeZone` (IANA name) is optional and defaults to the host zone; an invalid zone is **rejected** rather than falling back, so a schedule never fires at an unintended wall-clock time. An unparseable expression is rejected.
+- **cron** — `{ "kind": "cron", "cron": "0 0 9 * * 1-5" }`. A 6-field cron expression (`second minute hour day-of-month month day-of-week`), firing repeatedly (`"0 0 9 * * 1-5"` = 9:00am every weekday). Cron expressions always evaluate in the host time zone. There is deliberately no per-job time-zone option: the host's zone is the single source of truth, while an agent-settable option can pin individual jobs to stale or incorrect zones. An unparseable expression is rejected.
 - **once** — `{ "kind": "once", "at": "+10m" }`. A single future time: relative (`"+10m"`, `"+2h"`, `"+1d"`) or absolute ISO (`"2026-07-24T09:00:00Z"`). Fires exactly once. A non-future or unparseable time is rejected.
 - **now** — `{ "kind": "now" }`. Fires immediately on registration, once. Useful mainly with the `subagent` action ("go do this in the background right now"); valid with any action. A `now` job is never persisted — it fires and is gone.
 
@@ -45,6 +45,8 @@ There is deliberately no human-only "notify" mode: notifying a person is agent w
 Jobs are created and managed exclusively by the agent, through tools. There is no human-facing command.
 
 Three creator tools, one per action kind. Each returns `{ jobId, trigger, action, deliverAs, nextRunAt }` and takes an optional `deliverAs` (see [Delivery](#delivery-deliveras)). Rejected input (the "rejected" cases in the trigger definitions above) is returned as a tool error rather than silently accepted. The persisted job model stays `{ trigger, action, deliverAs }`; the tools are entry points over it, and the stored action kind for `process` remains `command` (existing persisted jobs load unchanged).
+
+Pi's TypeBox validation permits unknown object fields. A creator call that still includes the removed `timeZone` field therefore passes schema validation, but runner ignores the field and stores only the canonical host-zone cron trigger. `timeZone` is absent from all creator schemas and is not part of the tool surface.
 
 ### `prompt`
 
@@ -78,7 +80,7 @@ List active jobs. Returns an array of `{ jobId, trigger, action, deliverAs, next
 
 All seven tools define `renderCall`/`renderResult` in the house style — accent tool name, muted detail, no raw JSON in the transcript:
 
-- **Calls** render as one line: the tool name plus a compact summary — a ~60-char preview of the prompt/message/command, the trigger as `now` / the relative time / the cron string (+ zone when set), `maxMinutes` when set, jobIds as their first 8 characters. Examples: `subagent · "summarize the last 3 commits" · max 5m`, `process · git fetch --all · cron 0 */15 * * * *`, `steer · a7953fc5 · "focus on pi-tools only"`.
+- **Calls** render as one line: the tool name plus a compact summary — a ~60-char preview of the prompt/message/command, the trigger as `now` / the relative time / the cron string, `maxMinutes` when set, jobIds as their first 8 characters. Examples: `subagent · "summarize the last 3 commits" · max 5m`, `process · git fetch --all · cron 0 */15 * * * *`, `steer · a7953fc5 · "focus on pi-tools only"`.
 - **Results** render compact by default and fuller when expanded (pi's expanded rendering option): creators as a one-line confirmation with the short jobId and humanized next run (`· running` for now-jobs); `list` as one line per job (short id, kind, preview, next run, running age) instead of a JSON array; `peek` as the log lines themselves in a muted block; `cancel`/`steer` as one-line confirmations; failures in the error color.
 
 ## Firing
@@ -136,6 +138,7 @@ Jobs persist per session, keyed by session id:
 - On `session_start`, runner reads the current session's file and reschedules its jobs. So `/resume` restores that session's jobs across restarts; `/new` starts empty; each resumed session restores exactly what it had.
 - On `session_shutdown`, runner stops the in-memory timers (and kills any running command child) but keeps the file — that is what survives.
 - Each job stores only its definition (`jobId`, `trigger`, `action`, `deliverAs`); live `croner` timers are reconstructed on load. A job persisted by an earlier version as a top-level `message` with no `action` is loaded as a `prompt` action with `followUp` delivery.
+- A persisted cron trigger from an earlier version may still contain `timeZone`. Runner loads the job without that field, schedules it in the host time zone, and emits one warning per session regardless of how many stale jobs were found. Loading alone does not rewrite the file; the next normal persistence write stores the canonical trigger without `timeZone`.
 
 On reload, a `once` job whose time already passed while the session was closed is dropped (a reminder firing hours late is noise). A `cron` job simply resumes its normal schedule — missed ticks are not caught up.
 

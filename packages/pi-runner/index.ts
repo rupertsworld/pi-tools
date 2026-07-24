@@ -19,7 +19,6 @@ import { Cron } from "croner";
 type CronTrigger = {
 	kind: "cron";
 	cron: string;
-	timeZone?: string;
 };
 
 type OnceTrigger = {
@@ -122,7 +121,6 @@ const triggerSchema = Type.Union([
 	Type.Object({
 		kind: StringEnum(["cron"] as const),
 		cron: Type.String({ description: "Six-field cron expression" }),
-		timeZone: Type.Optional(Type.String({ description: "Optional IANA time zone" })),
 	}),
 	Type.Object({
 		kind: StringEnum(["once"] as const),
@@ -188,7 +186,7 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 	) {
 		const definition: JobDefinition = {
 			jobId: randomUUID(),
-			trigger,
+			trigger: normalizeTrigger(trigger),
 			action,
 			deliverAs: deliverAs ?? "followUp",
 		};
@@ -380,14 +378,12 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 			cron = new Cron(parseOnceTime(definition.trigger.at), options, () => fireJob(job));
 			nextRunAt = requiredCronNextRun(cron, definition.jobId).toISOString();
 		} else {
-			validateTimeZone(definition.trigger.timeZone);
 			try {
 				cron = new Cron(
 					definition.trigger.cron,
 					{
 						...options,
 						mode: "6-part",
-						timezone: definition.trigger.timeZone,
 					},
 					() => fireJob(job),
 				);
@@ -663,7 +659,16 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 		const contents = await fs.readFile(persistencePath(ctx), "utf8");
 		const definitions: unknown = JSON.parse(contents);
 		if (!Array.isArray(definitions)) throw new Error("persisted schedules must be an array");
-		return definitions.map(normalizeDefinition);
+		const hasStaleTimeZone = definitions.some(hasPersistedTimeZone);
+		const normalized = definitions.map(normalizeDefinition);
+		if (hasStaleTimeZone) {
+			notify(
+				ctx,
+				"Runner ignored stale per-job timeZone fields; cron schedules use the host time zone.",
+				"warning",
+			);
+		}
+		return normalized;
 	}
 
 	async function writeJobs(ctx: ExtensionContext): Promise<void> {
@@ -736,9 +741,7 @@ function jobLogPath(jobId: string): string {
 }
 
 function describeTrigger(trigger: Trigger): string {
-	if (trigger.kind === "cron") {
-		return `cron ${trigger.cron}${trigger.timeZone ? ` timezone=${trigger.timeZone}` : ""}`;
-	}
+	if (trigger.kind === "cron") return `cron ${trigger.cron}`;
 	if (trigger.kind === "once") return `once ${trigger.at}`;
 	return "now";
 }
@@ -760,15 +763,6 @@ function parseOnceTime(at: string): Date {
 	if (!Number.isFinite(timestamp)) throw new Error(`Invalid one-shot time "${at}".`);
 	if (timestamp <= Date.now()) throw new Error(`One-shot time "${at}" must be in the future.`);
 	return new Date(timestamp);
-}
-
-function validateTimeZone(timeZone: string | undefined): void {
-	if (!timeZone) return;
-	try {
-		new Intl.DateTimeFormat("en-US", { timeZone }).format();
-	} catch {
-		throw new Error(`Invalid time zone "${timeZone}". Use an IANA time zone name.`);
-	}
 }
 
 function describeJob(job: Job): JobDetails {
@@ -813,7 +807,7 @@ function normalizeDefinition(value: unknown): JobDefinition {
 	if (definition.action) {
 		return {
 			jobId: definition.jobId,
-			trigger: definition.trigger,
+			trigger: normalizeTrigger(definition.trigger),
 			action: definition.action,
 			deliverAs: definition.deliverAs ?? "followUp",
 		};
@@ -821,12 +815,30 @@ function normalizeDefinition(value: unknown): JobDefinition {
 	if (typeof definition.message === "string") {
 		return {
 			jobId: definition.jobId,
-			trigger: definition.trigger,
+			trigger: normalizeTrigger(definition.trigger),
 			action: { kind: "prompt", message: definition.message },
 			deliverAs: "followUp",
 		};
 	}
 	throw new Error(`persisted job ${definition.jobId} has no action`);
+}
+
+function normalizeTrigger(trigger: Trigger): Trigger {
+	if (trigger.kind === "cron") return { kind: "cron", cron: trigger.cron };
+	if (trigger.kind === "once") return { kind: "once", at: trigger.at };
+	if (trigger.kind === "now") return { kind: "now" };
+	return trigger;
+}
+
+function hasPersistedTimeZone(value: unknown): boolean {
+	if (!value || typeof value !== "object") return false;
+	const trigger = (value as { trigger?: unknown }).trigger;
+	return Boolean(
+		trigger
+		&& typeof trigger === "object"
+		&& (trigger as { kind?: unknown }).kind === "cron"
+		&& Object.hasOwn(trigger, "timeZone"),
+	);
 }
 
 async function stopJob(job: Job): Promise<void> {
@@ -1109,7 +1121,7 @@ function truncatePreview(value: string): string {
 function renderTrigger(trigger: Trigger): string {
 	if (trigger.kind === "now") return "now";
 	if (trigger.kind === "once") return trigger.at;
-	return `cron ${trigger.cron}${trigger.timeZone ? ` ${trigger.timeZone}` : ""}`;
+	return `cron ${trigger.cron}`;
 }
 
 function humanizeTime(timestamp: string): string {

@@ -110,6 +110,31 @@ describe("runner tools", () => {
 		assert.equal(Value.Check(parameters, { message: "Scheduled", trigger: { kind: "once", at: "+10m" } }), true);
 	});
 
+	it("omits timeZone from creator schemas and ignores it when TypeBox allows the unknown field", async () => {
+		for (const name of ["prompt", "process", "subagent"]) {
+			const parameters = stub.tools.get(name)?.parameters as {
+				properties?: { trigger?: { anyOf?: Array<{ properties?: Record<string, unknown> }> } };
+			};
+			const cronSchema = parameters.properties?.trigger?.anyOf?.find(
+				(candidate) => candidate.properties?.cron,
+			);
+			assert.ok(cronSchema, `${name} should expose a cron trigger schema`);
+			assert.equal("timeZone" in (cronSchema.properties ?? {}), false);
+		}
+
+		const trigger = { kind: "cron", cron: "0 0 9 * * *", timeZone: "America/Los_Angeles" };
+		const parameters = stub.tools.get("prompt")?.parameters;
+		assert.ok(parameters);
+		assert.equal(Value.Check(parameters, { message: "Host time", trigger }), true);
+
+		const result = await runTool("prompt", { message: "Host time", trigger });
+		assert.deepEqual((result.details as ScheduledJob).trigger, { kind: "cron", cron: trigger.cron });
+		assert.deepEqual((readPersistedJobs() as Array<{ trigger: unknown }>)[0]?.trigger, {
+			kind: "cron",
+			cron: trigger.cron,
+		});
+	});
+
 	it("process without a trigger fires immediately and is not persisted", async () => {
 		const result = await runTool("process", { command: "printf immediate" });
 		assert.deepEqual((result.details as ScheduledJob).trigger, { kind: "now" });
@@ -157,8 +182,8 @@ describe("runner tools", () => {
 		assert.equal(renderCall("subagent", { prompt: "summarize the last 3 commits", maxMinutes: 5 }), "<accent:subagent><muted: · \"summarize the last 3 commits\" · max 5m>");
 		assert.equal(renderCall("process", {
 			command: "git fetch --all",
-			trigger: { kind: "cron", cron: "0 */15 * * * *", timeZone: "Australia/Sydney" },
-		}), "<accent:process><muted: · git fetch --all · cron 0 */15 * * * * Australia/Sydney>");
+			trigger: { kind: "cron", cron: "0 */15 * * * *" },
+		}), "<accent:process><muted: · git fetch --all · cron 0 */15 * * * *>");
 
 		const peekResult = toolResultForRender("first line\nsecond line", { jobId: "a7953fc5-rest", lines: 2, totalBytes: 23 });
 		assert.equal(renderResult("peek", peekResult), "<muted:first line\nsecond line>");
@@ -534,17 +559,6 @@ describe("runner tools", () => {
 
 		assert.equal(result.isError, true);
 		assert.match(result.content[0]!.text, /invalid cron/i);
-		assert.deepEqual((await runTool("list", {})).details, []);
-	});
-
-	it("reports invalid time zones as tool errors", async () => {
-		const result = await runCreator({
-			trigger: { kind: "cron", cron: "0 * * * * *", timeZone: "Not/AZone" },
-			action: { kind: "prompt", message: "Never" },
-		});
-
-		assert.equal(result.isError, true);
-		assert.match(result.content[0]!.text, /time.?zone/i);
 		assert.deepEqual((await runTool("list", {})).details, []);
 	});
 
@@ -940,6 +954,51 @@ describe("runner lifecycle", () => {
 			const cron = scheduledJobs.find((candidate) => candidate.name === definition.jobId);
 			assert.ok(cron);
 			assert.equal(cron.isRunning(), true);
+		}
+	});
+
+	it("loads stale persisted timeZone fields in the host zone, warns once, and removes them on the next write", async () => {
+		const originalTimeZone = process.env.TZ;
+		process.env.TZ = "Australia/Sydney";
+		try {
+			writePersistedJobs([
+				{
+					jobId: "stale-zone-one",
+					action: { kind: "prompt", message: "First" },
+					deliverAs: "followUp",
+					trigger: { kind: "cron", cron: "0 0 9 * * *", timeZone: "America/Los_Angeles" },
+				},
+				{
+					jobId: "stale-zone-two",
+					action: { kind: "prompt", message: "Second" },
+					deliverAs: "followUp",
+					trigger: { kind: "cron", cron: "0 0 10 * * *", timeZone: "Europe/London" },
+				},
+			]);
+
+			await assert.doesNotReject(fireEvent("session_start"));
+
+			const listed = (await runTool("list", {})).details as ScheduledJob[];
+			assert.equal(listed.length, 2);
+			assert.deepEqual(listed.map(({ trigger }) => trigger), [
+				{ kind: "cron", cron: "0 0 9 * * *" },
+				{ kind: "cron", cron: "0 0 10 * * *" },
+			]);
+			assert.equal(new Date(listed[0]!.nextRunAt).getHours(), 9);
+			assert.equal(new Date(listed[1]!.nextRunAt).getHours(), 10);
+			const staleZoneWarnings = stubCtx.notifications.filter(({ message }) => /time.?zone/i.test(message));
+			assert.equal(staleZoneWarnings.length, 1);
+			assert.equal(staleZoneWarnings[0]!.type, "warning");
+
+			assert.equal(JSON.stringify(readPersistedJobs()).includes("timeZone"), true);
+			await runCreator({
+				trigger: { kind: "cron", cron: "0 0 11 * * *" },
+				action: { kind: "prompt", message: "Trigger the next persistence write" },
+			});
+			assert.equal(JSON.stringify(readPersistedJobs()).includes("timeZone"), false);
+		} finally {
+			if (originalTimeZone === undefined) delete process.env.TZ;
+			else process.env.TZ = originalTimeZone;
 		}
 	});
 
