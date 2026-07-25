@@ -2,12 +2,17 @@
  * Structured HTTP calling tool for pi agents.
  */
 
+import { readFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
 const BODY_LIMIT_BYTES = 16 * 1024;
 const DEFAULT_TIMEOUT_SECONDS = 30;
+const MAX_REDIRECT_HOPS = 10;
 const methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] as const;
 
 type HttpDetails = {
@@ -32,7 +37,10 @@ export default function (pi: ExtensionAPI) {
 		label: "HTTP Request",
 		description: "Make an HTTP or HTTPS request and return the response.",
 		parameters: Type.Object({
-			url: Type.String({ minLength: 1, description: "HTTP or HTTPS URL" }),
+			url: Type.String({
+				minLength: 1,
+				description: "HTTP or HTTPS URL, or a path relative to the configured base when one is set",
+			}),
 			method: Type.Optional(StringEnum(methods)),
 			headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 			body: Type.Optional(Type.Union([
@@ -48,14 +56,21 @@ export default function (pi: ExtensionAPI) {
 			const method = params.method ?? "GET";
 			const timeoutSeconds = params.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
 
+			const config = await loadBaseConfig();
+			if ("error" in config) return errorResult(config.error);
+			const base = config.base;
+
 			let url: URL;
 			try {
-				url = new URL(params.url);
+				url = base === undefined ? new URL(params.url) : new URL(params.url, base);
 			} catch {
 				return errorResult("Invalid URL. The URL must use http:// or https://.");
 			}
 			if (url.protocol !== "http:" && url.protocol !== "https:") {
 				return errorResult("Invalid URL scheme. The URL must use http:// or https://.");
+			}
+			if (base !== undefined && url.origin !== base.origin) {
+				return errorResult(`Request to ${url.origin} refused: requests are restricted to the configured base ${base.origin}.`);
 			}
 			if ((method === "GET" || method === "HEAD") && params.body !== undefined) {
 				return errorResult(`${method} requests cannot include a body.`);
@@ -86,12 +101,18 @@ export default function (pi: ExtensionAPI) {
 				return errorResult(`Invalid HTTP timeout: ${describeError(error)}`);
 			}
 			try {
-				const response = await fetch(url, {
-					method,
-					headers,
-					...(body === undefined ? {} : { body }),
-					signal: timeoutSignal,
-				});
+				const outcome = base === undefined
+					? {
+						response: await fetch(url, {
+							method,
+							headers,
+							...(body === undefined ? {} : { body }),
+							signal: timeoutSignal,
+						}),
+					}
+					: await fetchWithinBase(url, base, method, headers, body, timeoutSignal);
+				if ("error" in outcome) return errorResult(outcome.error);
+				const response = outcome.response;
 				const bytes = new Uint8Array(await response.arrayBuffer());
 				const contentType = response.headers.get("content-type") ?? "unknown";
 				const textual = isTextualContentType(contentType);
@@ -127,6 +148,115 @@ export default function (pi: ExtensionAPI) {
 			return new Text(renderResult(result, options.expanded, theme, context.isError === true), 0, 0);
 		},
 	});
+}
+
+async function loadBaseConfig(): Promise<{ base?: URL } | { error: string }> {
+	const agentDir = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
+	const configPath = path.join(agentDir, "http.json");
+	let raw: string;
+	try {
+		raw = await readFile(configPath, "utf8");
+	} catch (error) {
+		if (isErrnoException(error) && error.code === "ENOENT") return {};
+		return { error: `HTTP config ${configPath} could not be read (${describeError(error)}); refusing all requests.` };
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return { error: `HTTP config ${configPath} is not valid JSON; refusing all requests.` };
+	}
+	// The restriction lives in the "base" key, not in the file's existence: a present
+	// config without "base" is unrestricted. The schema is strict instead — any
+	// unrecognized top-level key fails closed, so a mistyped lock cannot fail open.
+	if (!isRecord(parsed) || Array.isArray(parsed)) {
+		return { error: `HTTP config ${configPath} is invalid: expected a JSON object like {"base": "http://host:8770"}; refusing all requests.` };
+	}
+	const unknownKey = Object.keys(parsed).find((key) => key !== "base");
+	if (unknownKey !== undefined) {
+		return { error: `HTTP config ${configPath} is invalid: unrecognized key ${JSON.stringify(unknownKey)} (the only recognized key is "base"); refusing all requests.` };
+	}
+	if (parsed.base === undefined) return {};
+	if (typeof parsed.base !== "string") return invalidBaseError(configPath);
+	let base: URL;
+	try {
+		base = new URL(parsed.base);
+	} catch {
+		return invalidBaseError(configPath);
+	}
+	if (
+		(base.protocol !== "http:" && base.protocol !== "https:")
+		|| base.pathname !== "/"
+		|| base.search !== ""
+		|| base.hash !== ""
+		|| base.username !== ""
+		|| base.password !== ""
+	) {
+		return invalidBaseError(configPath);
+	}
+	return { base };
+}
+
+function invalidBaseError(configPath: string): { error: string } {
+	return {
+		error: `HTTP config ${configPath} is invalid: "base" must be an http(s) origin like "http://host:8770" — no path, query, or fragment; refusing all requests.`,
+	};
+}
+
+async function fetchWithinBase(
+	url: URL,
+	base: URL,
+	method: string,
+	headers: Headers,
+	body: string | undefined,
+	signal: AbortSignal,
+): Promise<{ response: Response } | { error: string }> {
+	let currentUrl = url;
+	let currentMethod = method;
+	let currentBody = body;
+	// `<=` so up to MAX_REDIRECT_HOPS redirects are followed (MAX + 1 requests in total).
+	for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop += 1) {
+		const response = await fetch(currentUrl, {
+			method: currentMethod,
+			headers,
+			...(currentBody === undefined ? {} : { body: currentBody }),
+			signal,
+			redirect: "manual",
+		});
+		const location = response.headers.get("location");
+		if (!isRedirectStatus(response.status) || location === null) return { response };
+		await response.body?.cancel();
+		let next: URL;
+		try {
+			next = new URL(location, currentUrl);
+		} catch {
+			return { error: `Redirect to invalid URL: ${location}` };
+		}
+		if (next.origin !== base.origin) {
+			return { error: `Redirect to ${next.origin} refused: requests are restricted to the configured base ${base.origin}.` };
+		}
+		// Per fetch's redirect algorithm: 303 converts anything but GET/HEAD to a
+		// body-less GET, as do 301/302 answering a POST; 307/308 keep method and body.
+		const convertToGet = (response.status === 303 && currentMethod !== "GET" && currentMethod !== "HEAD")
+			|| ((response.status === 301 || response.status === 302) && currentMethod === "POST");
+		if (convertToGet) {
+			currentMethod = "GET";
+			currentBody = undefined;
+			for (const name of ["content-type", "content-length", "content-encoding", "content-language", "content-location"]) {
+				headers.delete(name);
+			}
+		}
+		currentUrl = next;
+	}
+	return { error: `Redirect chain exceeded ${MAX_REDIRECT_HOPS} hops.` };
+}
+
+function isRedirectStatus(status: number): boolean {
+	return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
+	return error instanceof Error && "code" in error;
 }
 
 function decodeText(bytes: Uint8Array, truncated: boolean): string {

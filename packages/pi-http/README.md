@@ -15,4 +15,4 @@ One agent-callable tool, `http`:
 - Text responses are capped at 16 KiB (head kept, marker for the rest); binary responses report type and size instead of bytes.
 - Rendered compactly: `http · POST api.linear.app/graphql` → `200 · application/json · 1.2 KB`.
 
-No configuration, no dependencies. `SPEC.md` is the authority on behavior.
+No dependencies; one optional config — a `base` in `http.json` confines every request (redirects included) to a single origin and lets `url` be a relative path. `SPEC.md` is the authority on behavior.

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import http, { type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { type AddressInfo } from "node:net";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -43,10 +46,12 @@ type ToolDefinition = {
 };
 
 let tool: ToolDefinition;
+let agentDir: string;
+let previousAgentDir: string | undefined;
 const servers: Server[] = [];
 const sockets = new Set<import("node:net").Socket>();
 
-beforeEach(() => {
+beforeEach(async () => {
 	const tools = new Map<string, ToolDefinition>();
 	const pi = {
 		registerTool(definition: ToolDefinition & { name: string }) {
@@ -57,9 +62,15 @@ beforeEach(() => {
 	const registered = tools.get("http");
 	assert.ok(registered);
 	tool = registered;
+	agentDir = await mkdtemp(path.join(os.tmpdir(), "pi-http-test-"));
+	previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
 });
 
 afterEach(async () => {
+	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	await rm(agentDir, { recursive: true, force: true });
 	for (const socket of sockets) socket.destroy();
 	sockets.clear();
 	await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
@@ -279,6 +290,356 @@ describe("http tool", () => {
 	});
 });
 
+describe("http tool without a configured base", () => {
+	it("rejects a relative url", async () => {
+		const result = await runTool({ url: "/vault/search" });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /http.*https/i);
+	});
+
+	it("treats a present config without a base key as unrestricted", async () => {
+		const url = await serve((_request, response) => {
+			response.writeHead(200, { "content-type": "text/plain" });
+			response.end("open");
+		});
+		await writeFile(path.join(agentDir, "http.json"), "{}");
+
+		const absolute = await runTool({ url });
+		assert.equal(absolute.isError, undefined);
+		assert.match(absolute.content[0]!.text, /open/);
+
+		const relative = await runTool({ url: "/vault/search" });
+		assert.equal(relative.isError, true);
+		assert.match(relative.content[0]!.text, /http.*https/i);
+	});
+});
+
+describe("http tool with a configured base", () => {
+	it("resolves a relative url with a leading slash against the base", async () => {
+		let seen = "";
+		const base = await serve((request, response) => {
+			seen = request.url ?? "";
+			response.writeHead(200, { "content-type": "text/plain" });
+			response.end("ok");
+		});
+		await configureBase(base);
+
+		const result = await runTool({ url: "/vault/search?q=x" });
+
+		assert.equal(result.isError, undefined);
+		assert.equal((result.details as HttpDetails).status, 200);
+		assert.equal(seen, "/vault/search?q=x");
+	});
+
+	it("resolves a relative url without a leading slash, tolerating a trailing slash on the base", async () => {
+		let seen = "";
+		const base = await serve((request, response) => {
+			seen = request.url ?? "";
+			response.writeHead(200, { "content-type": "text/plain" });
+			response.end("ok");
+		});
+		await configureBase(`${base}/`);
+
+		const result = await runTool({ url: "vault/search" });
+
+		assert.equal(result.isError, undefined);
+		assert.equal(seen, "/vault/search");
+	});
+
+	it("allows an absolute url on the base origin", async () => {
+		let seen = "";
+		const base = await serve((request, response) => {
+			seen = request.url ?? "";
+			response.writeHead(200, { "content-type": "text/plain" });
+			response.end("ok");
+		});
+		await configureBase(base);
+
+		const result = await runTool({ url: `${base}/direct` });
+
+		assert.equal(result.isError, undefined);
+		assert.equal(seen, "/direct");
+	});
+
+	it("rejects an unrecognized key alongside a valid base, naming the key", async () => {
+		const base = await serve((_request, response) => response.end("ok"));
+		await writeFile(path.join(agentDir, "http.json"), JSON.stringify({ base, future: true }));
+
+		const result = await runTool({ url: "/anything" });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /http\.json/);
+		assert.match(result.content[0]!.text, /future/);
+	});
+
+	it("rejects a protocol-relative url pointing off the base origin", async () => {
+		let offOriginHits = 0;
+		const base = await serve((_request, response) => response.end("ok"));
+		const other = await serve((_request, response) => {
+			offOriginHits += 1;
+			response.end("stolen");
+		});
+		await configureBase(base);
+
+		const result = await runTool({ url: `//${new URL(other).host}/x` });
+
+		assert.equal(result.isError, true);
+		assert.ok(result.content[0]!.text.includes(base));
+		assert.equal(offOriginHits, 0);
+	});
+
+	it("rejects an absolute url off the base origin, naming the base", async () => {
+		let offOriginHits = 0;
+		const base = await serve((_request, response) => response.end("ok"));
+		const other = await serve((_request, response) => {
+			offOriginHits += 1;
+			response.end("stolen");
+		});
+		await configureBase(base);
+
+		const result = await runTool({ url: `${other}/steal` });
+
+		assert.equal(result.isError, true);
+		assert.ok(result.content[0]!.text.includes(base));
+		assert.equal(offOriginHits, 0);
+	});
+
+	it("rejects a cross-origin redirect mid-chain, naming the base", async () => {
+		let offOriginHits = 0;
+		const other = await serve((_request, response) => {
+			offOriginHits += 1;
+			response.end("exfiltrated");
+		});
+		const base = await serve((_request, response) => {
+			response.writeHead(302, { location: `${other}/exfil` });
+			response.end();
+		});
+		await configureBase(base);
+
+		const result = await runTool({ url: "/start" });
+
+		assert.equal(result.isError, true);
+		assert.ok(result.content[0]!.text.includes(base));
+		assert.equal(offOriginHits, 0);
+	});
+
+	it("follows a same-origin redirect chain", async () => {
+		const requests: string[] = [];
+		const base = await serve((request, response) => {
+			requests.push(`${request.method} ${request.url}`);
+			if (request.url === "/a") {
+				response.writeHead(302, { location: "/b" });
+				response.end();
+				return;
+			}
+			if (request.url === "/b") {
+				response.writeHead(301, { location: "/c" });
+				response.end();
+				return;
+			}
+			response.writeHead(200, { "content-type": "text/plain" });
+			response.end("arrived");
+		});
+		await configureBase(base);
+
+		const result = await runTool({ url: "/a" });
+
+		assert.equal(result.isError, undefined);
+		assert.equal((result.details as HttpDetails).status, 200);
+		assert.match(result.content[0]!.text, /arrived/);
+		assert.deepEqual(requests, ["GET /a", "GET /b", "GET /c"]);
+	});
+
+	it("converts a 303 redirect after POST into a body-less GET", async () => {
+		const seen: Array<{ method: string; url: string; body: string }> = [];
+		const base = await serve(async (request, response) => {
+			seen.push({
+				method: request.method ?? "",
+				url: request.url ?? "",
+				body: await readRequest(request),
+			});
+			if (request.url === "/submit") {
+				response.writeHead(303, { location: "/done" });
+				response.end();
+				return;
+			}
+			response.writeHead(200, { "content-type": "text/plain" });
+			response.end("done");
+		});
+		await configureBase(base);
+
+		const result = await runTool({ url: "/submit", method: "POST", body: "payload" });
+
+		assert.equal(result.isError, undefined);
+		assert.deepEqual(seen, [
+			{ method: "POST", url: "/submit", body: "payload" },
+			{ method: "GET", url: "/done", body: "" },
+		]);
+	});
+
+	it("preserves method and body across 307 and 308 redirects", async () => {
+		const seen: Array<{ method: string; url: string; body: string }> = [];
+		const base = await serve(async (request, response) => {
+			seen.push({
+				method: request.method ?? "",
+				url: request.url ?? "",
+				body: await readRequest(request),
+			});
+			if (request.url === "/a") {
+				response.writeHead(307, { location: "/b" });
+				response.end();
+				return;
+			}
+			if (request.url === "/b") {
+				response.writeHead(308, { location: "/c" });
+				response.end();
+				return;
+			}
+			response.writeHead(200, { "content-type": "text/plain" });
+			response.end("kept");
+		});
+		await configureBase(base);
+
+		const result = await runTool({ url: "/a", method: "PUT", body: "payload" });
+
+		assert.equal(result.isError, undefined);
+		assert.deepEqual(seen, [
+			{ method: "PUT", url: "/a", body: "payload" },
+			{ method: "PUT", url: "/b", body: "payload" },
+			{ method: "PUT", url: "/c", body: "payload" },
+		]);
+	});
+
+	it("keeps HEAD unchanged across a 303 redirect", async () => {
+		const seen: string[] = [];
+		const base = await serve((request, response) => {
+			seen.push(`${request.method} ${request.url}`);
+			if (request.url === "/a") {
+				response.writeHead(303, { location: "/b" });
+				response.end();
+				return;
+			}
+			response.writeHead(200, { "content-type": "text/plain" });
+			response.end();
+		});
+		await configureBase(base);
+
+		const result = await runTool({ url: "/a", method: "HEAD" });
+
+		assert.equal(result.isError, undefined);
+		assert.deepEqual(seen, ["HEAD /a", "HEAD /b"]);
+	});
+
+	it("follows an absolute same-origin Location", async () => {
+		let requests = 0;
+		let base = "";
+		base = await serve((request, response) => {
+			requests += 1;
+			if (request.url === "/a") {
+				response.writeHead(302, { location: `${base}/b` });
+				response.end();
+				return;
+			}
+			response.writeHead(200, { "content-type": "text/plain" });
+			response.end("arrived");
+		});
+		await configureBase(base);
+
+		const result = await runTool({ url: "/a" });
+
+		assert.equal(result.isError, undefined);
+		assert.equal(requests, 2);
+		assert.match(result.content[0]!.text, /arrived/);
+	});
+
+	it("caps a same-origin redirect loop with a tool error", async () => {
+		let hits = 0;
+		const base = await serve((_request, response) => {
+			hits += 1;
+			response.writeHead(302, { location: "/loop" });
+			response.end();
+		});
+		await configureBase(base);
+
+		const result = await runTool({ url: "/loop" });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /redirect/i);
+		assert.ok(hits <= 11, `expected at most 11 requests, saw ${hits}`);
+	});
+});
+
+describe("http tool with a broken config (fails closed)", () => {
+	for (const base of [
+		"http://host:8770/path",
+		"ftp://host:8770",
+		"http://host:8770?q=1",
+		"http://host:8770#fragment",
+		"http://user:pass@host:8770",
+		"not a url",
+	]) {
+		it(`rejects every call when base is ${JSON.stringify(base)}`, async () => {
+			await configureBase(base);
+
+			const result = await runTool({ url: "http://example.test/" });
+
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]!.text, /http\.json/);
+			assert.match(result.content[0]!.text, /base/);
+		});
+	}
+
+	it("rejects every call when the config has a typo'd base key, naming the key", async () => {
+		await writeFile(path.join(agentDir, "http.json"), '{"bsae": "http://host:8770"}');
+
+		const result = await runTool({ url: "http://example.test/" });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /http\.json/);
+		assert.match(result.content[0]!.text, /bsae/);
+	});
+
+	it("rejects every call when the config is a top-level array", async () => {
+		await writeFile(path.join(agentDir, "http.json"), "[]");
+
+		const result = await runTool({ url: "http://example.test/" });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /http\.json/);
+		assert.match(result.content[0]!.text, /object/);
+	});
+
+	it("rejects every call when base is not a string", async () => {
+		await writeFile(path.join(agentDir, "http.json"), '{"base": 42}');
+
+		const result = await runTool({ url: "http://example.test/" });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /http\.json/);
+		assert.match(result.content[0]!.text, /base/);
+	});
+
+	it("rejects every call when the config is not valid JSON", async () => {
+		await writeFile(path.join(agentDir, "http.json"), "{nope");
+
+		const result = await runTool({ url: "http://example.test/" });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /http\.json/);
+		assert.match(result.content[0]!.text, /JSON/);
+	});
+
+	it("rejects every call when the config is unreadable", async () => {
+		await mkdir(path.join(agentDir, "http.json"));
+
+		const result = await runTool({ url: "http://example.test/" });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /http\.json/);
+	});
+});
+
 describe("http rendering", () => {
 	const theme: RenderTheme = {
 		fg(color, text) {
@@ -328,6 +689,10 @@ async function readRequest(request: IncomingMessage): Promise<string> {
 	const chunks: Buffer[] = [];
 	for await (const chunk of request) chunks.push(Buffer.from(chunk));
 	return Buffer.concat(chunks).toString("utf8");
+}
+
+async function configureBase(base: string): Promise<void> {
+	await writeFile(path.join(agentDir, "http.json"), JSON.stringify({ base }));
 }
 
 async function runTool(params: object): Promise<ToolResult> {

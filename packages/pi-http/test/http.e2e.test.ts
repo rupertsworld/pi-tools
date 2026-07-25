@@ -33,6 +33,8 @@ describe("http extension registration", () => {
 			const schema = session.getToolDefinition("http")?.parameters;
 			assert.ok(schema);
 			assert.equal(Object.getOwnPropertyDescriptor(schema, "~kind")?.value, "Object");
+			const urlDescription = (schema as { properties?: { url?: { description?: string } } }).properties?.url?.description;
+			assert.match(urlDescription ?? "", /base/i, "url description should mention the base-relative form");
 
 			for (const value of [
 				{ url: "https://example.test" },
