@@ -12,6 +12,7 @@ Each package is independently published to npm under the `@telepath-computer` sc
 | [`@telepath-computer/pi-webhook`](packages/pi-webhook) | HTTP ingress for injecting messages into the receiving session — origin-allowlisted for browser senders, attach/detach lifecycle recorded in `webhook.json` |
 | [`@telepath-computer/pi-dynamic-context`](packages/pi-dynamic-context) | Per-turn refresh of system prompt and context files, with `{{DATE}}`/`{{TIME}}`/`{{TZ}}`-style template variables |
 | [`@telepath-computer/pi-acp`](packages/pi-acp) | ACP endpoint for driving a live pi session over a unix socket, plus a stdio↔socket relay bin |
+| [`@telepath-computer/pi-http`](packages/pi-http) | Structured HTTP calling tool — typed requests, rendered responses, no curl quoting hazards |
 
 ## Install
 
@@ -20,6 +21,7 @@ pi install npm:@telepath-computer/pi-runner
 pi install npm:@telepath-computer/pi-webhook
 pi install npm:@telepath-computer/pi-dynamic-context
 pi install npm:@telepath-computer/pi-acp
+pi install npm:@telepath-computer/pi-http
 ```
 
 For local development, install a package by path — pi references it in place, so edits go live on `/reload`:
