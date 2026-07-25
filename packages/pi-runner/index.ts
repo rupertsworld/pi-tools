@@ -1,10 +1,12 @@
 /**
  * Runner extension: schedule actions for delivery into the active session.
  *
- * Jobs are session-scoped and persisted between session loads. See SPEC.md.
+ * Jobs are session-scoped and persisted between session loads. runner.json in
+ * the agent home gates which action kinds register. See SPEC.md.
  */
 
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -54,6 +56,14 @@ export type SubagentAction = {
 
 type Action = PromptAction | CommandAction | SubagentAction;
 type Delivery = "followUp" | "nextTurn" | "steer";
+
+const ACTION_KINDS = ["prompt", "command", "subagent"] as const;
+type ActionKind = (typeof ACTION_KINDS)[number];
+
+interface RunnerConfig {
+	enabledKinds: ReadonlySet<ActionKind>;
+	warning?: string;
+}
 
 interface RunningProcess {
 	child: ChildProcess;
@@ -142,12 +152,24 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 	const firingJobs = new Map<string, Job>();
 	const logQueues = new Map<string, Promise<void>>();
 	const warnedLogJobs = new Set<string>();
+	const { enabledKinds, warning } = readRunnerConfig();
+	let pendingConfigWarning = warning;
 
 	pi.on("session_start", async (_event, ctx) => {
+		if (pendingConfigWarning && ctx.hasUI) {
+			notify(ctx, pendingConfigWarning, "warning");
+			pendingConfigWarning = undefined;
+		}
 		try {
 			const definitions = await readJobs(ctx);
 			let droppedJob = false;
+			const gatedJobIds: string[] = [];
 			for (const definition of definitions) {
+				if (!enabledKinds.has(definition.action.kind)) {
+					droppedJob = true;
+					gatedJobIds.push(definition.jobId);
+					continue;
+				}
 				if (definition.trigger.kind === "once" && Date.parse(definition.trigger.at) <= Date.now()) {
 					droppedJob = true;
 					continue;
@@ -158,6 +180,13 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 				} catch (error) {
 					notify(ctx, `Runner could not restore scheduled job ${definition.jobId} (${describeError(error)}).`, "warning");
 				}
+			}
+			if (gatedJobIds.length > 0) {
+				notify(
+					ctx,
+					`Runner dropped persisted job${gatedJobIds.length === 1 ? "" : "s"} ${gatedJobIds.join(", ")}: action kind disabled by runner.json.`,
+					"warning",
+				);
 			}
 			if (droppedJob) await writeJobs(ctx);
 		} catch (error) {
@@ -203,7 +232,7 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 		return toolResult(`Scheduled job ${job.jobId} for ${details.nextRunAt}.`, details);
 	}
 
-	pi.registerTool({
+	if (enabledKinds.has("prompt")) pi.registerTool({
 		name: "prompt",
 		label: "Schedule Prompt",
 		description: "Schedule a prompt for delivery into the current session.",
@@ -218,7 +247,7 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 		...toolRenderers("prompt"),
 	});
 
-	pi.registerTool({
+	if (enabledKinds.has("command")) pi.registerTool({
 		name: "process",
 		label: "Run Process",
 		description: "Run a shell command now or schedule it for later.",
@@ -239,7 +268,7 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 		...toolRenderers("process"),
 	});
 
-	pi.registerTool({
+	if (enabledKinds.has("subagent")) pi.registerTool({
 		name: "subagent",
 		label: "Run Subagent",
 		description: "Run an isolated subagent now or schedule it for later.",
@@ -298,7 +327,7 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 		...toolRenderers("cancel"),
 	});
 
-	pi.registerTool({
+	if (enabledKinds.has("subagent")) pi.registerTool({
 		name: "steer",
 		label: "Steer Running Subagent",
 		description: "Redirect a running subagent by job ID.",
@@ -720,14 +749,51 @@ async function waitForImmediateActionStart(job: Job, firingJobs: Map<string, Job
 	}
 }
 
+function agentDir(): string {
+	return process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
+}
+
+function readRunnerConfig(): RunnerConfig {
+	const configPath = path.join(agentDir(), "runner.json");
+	const allKinds: RunnerConfig = { enabledKinds: new Set(ACTION_KINDS) };
+	let raw: string;
+	try {
+		raw = readFileSync(configPath, "utf8");
+	} catch (error) {
+		if (isFileNotFound(error)) return allKinds;
+		return invalidRunnerConfig(configPath, describeError(error));
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		return invalidRunnerConfig(configPath, describeError(error));
+	}
+	if (!isRecord(parsed) || Array.isArray(parsed)) return invalidRunnerConfig(configPath, "config must be an object");
+	if (parsed.actions === undefined) return allKinds;
+	if (!Array.isArray(parsed.actions) || !parsed.actions.every(isActionKind)) {
+		return invalidRunnerConfig(configPath, `"actions" must be an array of ${ACTION_KINDS.join(", ")}`);
+	}
+	return { enabledKinds: new Set(parsed.actions) };
+}
+
+function invalidRunnerConfig(configPath: string, reason: string): RunnerConfig {
+	return {
+		enabledKinds: new Set<ActionKind>(["prompt"]),
+		warning: `Runner config ${configPath} is invalid (${reason}); registering the prompt action only.`,
+	};
+}
+
+function isActionKind(value: unknown): value is ActionKind {
+	return typeof value === "string" && (ACTION_KINDS as readonly string[]).includes(value);
+}
+
 function persistencePath(ctx: ExtensionContext): string {
-	const agentDir = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
-	return path.join(agentDir, "runner", `${ctx.sessionManager.getSessionId()}.json`);
+	return path.join(agentDir(), "runner", `${ctx.sessionManager.getSessionId()}.json`);
 }
 
 function jobLogPath(jobId: string): string {
-	const agentDir = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
-	const logsDirectory = path.resolve(agentDir, "runner", "logs");
+	const logsDirectory = path.resolve(agentDir(), "runner", "logs");
 	if (
 		!jobId
 		|| path.basename(jobId) !== jobId

@@ -15,6 +15,6 @@ Agent-callable tools (there is no human-facing command):
 - `subagent` — run or schedule an isolated, steerable `pi --mode rpc` child; its final answer is delivered back.
 - `cancel` / `steer` / `peek` / `list` — manage jobs, redirect a running subagent, tail any job's log, see what's active.
 
-Jobs persist per session (restored on `/resume`), every job keeps a full log under `runner/logs/`, and the footer shows `runner N scheduled · M running`. Cron evaluates in the host time zone by design.
+Jobs persist per session (restored on `/resume`), every job keeps a full log under `runner/logs/`, and the footer shows `runner N scheduled · M running`. Cron evaluates in the host time zone by design. A `runner.json` in the agent home can gate which action kinds register — a locked-down session can run `prompt`-only.
 
 `SPEC.md` is the authority on behavior.

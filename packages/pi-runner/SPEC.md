@@ -14,6 +14,16 @@ pi install npm:@telepath-computer/pi-runner
 
 It loads through the `packages` array of pi's settings like any other package. It has no dependency on any other pi package.
 
+## Configuration
+
+Runner reads `runner.json` from the coding-agent home (`$PI_CODING_AGENT_DIR`, default `~/.pi/agent`) once, at extension load:
+
+```json
+{ "actions": ["prompt", "command", "subagent"] }
+```
+
+`actions` lists the action kinds whose creator tools register (the kind `command` is created by the `process` tool). A missing file or a missing `actions` field enables all three kinds. An empty array is valid: no creator tools register. An invalid config — an unreadable file, invalid JSON, a top-level value that isn't an object (a bare `["prompt"]` array is a forgotten `actions` wrapper, not a permission grant), `actions` not an array, or an entry that isn't one of the three kinds — enables `prompt` only and warns once at session start: a config file present at all signals a lock was intended, so failure falls toward the safe subset.
+
 ## Jobs
 
 A job is a **trigger** (when) plus an **action** (what), with an optional **`deliverAs`** mode (how the result is delivered — pi's own `sendMessage` vocabulary). The three are independent — any action can run on any trigger with any delivery mode.
@@ -44,7 +54,7 @@ There is deliberately no human-only "notify" mode: notifying a person is agent w
 
 Jobs are created and managed exclusively by the agent, through tools. There is no human-facing command.
 
-Three creator tools, one per action kind. Each returns `{ jobId, trigger, action, deliverAs, nextRunAt }` and takes an optional `deliverAs` (see [Delivery](#delivery-deliveras)). Rejected input (the "rejected" cases in the trigger definitions above) is returned as a tool error rather than silently accepted. The persisted job model stays `{ trigger, action, deliverAs }`; the tools are entry points over it, and the stored action kind for `process` remains `command` (existing persisted jobs load unchanged).
+Three creator tools, one per action kind. Only the creators for kinds enabled in [Configuration](#configuration) register — a gated kind's tool is absent from the tool list entirely, not present-but-erroring. `steer` registers only when `subagent` is enabled (it is meaningless otherwise); `cancel`, `peek`, and `list` always register. Each creator returns `{ jobId, trigger, action, deliverAs, nextRunAt }` and takes an optional `deliverAs` (see [Delivery](#delivery-deliveras)). Rejected input (the "rejected" cases in the trigger definitions above) is returned as a tool error rather than silently accepted. The persisted job model stays `{ trigger, action, deliverAs }`; the tools are entry points over it, and the stored action kind for `process` remains `command` (existing persisted jobs load unchanged).
 
 Pi's TypeBox validation permits unknown object fields. A creator call that still includes the removed `timeZone` field therefore passes schema validation, but runner ignores the field and stores only the canonical host-zone cron trigger. `timeZone` is absent from all creator schemas and is not part of the tool surface.
 
@@ -142,8 +152,10 @@ Jobs persist per session, keyed by session id:
 
 On reload, a `once` job whose time already passed while the session was closed is dropped (a reminder firing hours late is noise). A `cron` job simply resumes its normal schedule — missed ticks are not caught up.
 
+A persisted job whose action kind is gated by `runner.json` (see [Configuration](#configuration)) is likewise not restored: runner warns once, naming the dropped job(s), and removes them from the file on the next write. Restoring such a job inert would misreport in `list`; executing it would defeat the gate.
+
 Runner is still session-scoped, not a daemon: jobs only fire while their owning session is running, and injecting a result needs a live session. Firing while no session is open remains out of scope (see [TODO.md](TODO.md)).
 
 ## Status
 
-Everything in this spec is implemented in `index.ts`. Triggers (`cron`, `once`, `now`), actions (`prompt`, `command`, `subagent`), delivery modes, the `steer` and `peek` tools, job logs, running state, persistence, and the status line are covered by unit tests (including a scripted RPC fake child exercising the real pipe/kill paths) and an end-to-end schema test through a real pi session.
+Everything in this spec is implemented in `index.ts`. Triggers (`cron`, `once`, `now`), actions (`prompt`, `command`, `subagent`), delivery modes, the `steer` and `peek` tools, job logs, running state, persistence, config-gated tool registration, and the status line are covered by unit tests (including a scripted RPC fake child exercising the real pipe/kill paths) and an end-to-end schema test through a real pi session.

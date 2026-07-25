@@ -1164,6 +1164,120 @@ describe("runner lifecycle", () => {
 	});
 });
 
+describe("runner action gating", () => {
+	const allTools = ["cancel", "list", "peek", "process", "prompt", "steer", "subagent"];
+
+	it("registers all seven tools without a config file", () => {
+		assert.deepEqual(registeredTools(), allTools);
+	});
+
+	it("registers all seven tools when runner.json has no actions field", async () => {
+		await reloadRunner("{}");
+		assert.deepEqual(registeredTools(), allTools);
+		await fireEvent("session_start");
+		assert.deepEqual(stubCtx.notifications, []);
+	});
+
+	it("registers exactly prompt, cancel, peek, and list for a prompt-only config", async () => {
+		await reloadRunner('{"actions":["prompt"]}');
+		assert.deepEqual(registeredTools(), ["cancel", "list", "peek", "prompt"]);
+		await fireEvent("session_start");
+		assert.deepEqual(stubCtx.notifications, []);
+	});
+
+	it("registers only cancel, peek, and list for an empty actions array", async () => {
+		await reloadRunner('{"actions":[]}');
+		assert.deepEqual(registeredTools(), ["cancel", "list", "peek"]);
+		await fireEvent("session_start");
+		assert.deepEqual(stubCtx.notifications, []);
+	});
+
+	it("registers subagent and steer together for a subagent-only config", async () => {
+		await reloadRunner('{"actions":["subagent"]}');
+		assert.deepEqual(registeredTools(), ["cancel", "list", "peek", "steer", "subagent"]);
+		await fireEvent("session_start");
+		assert.deepEqual(stubCtx.notifications, []);
+	});
+
+	it("falls back to prompt only and warns once at session_start for invalid configs", async () => {
+		for (const config of ["{not json", '["prompt"]', '{"actions":["prompt","shell"]}', '{"actions":"prompt"}']) {
+			await reloadRunner(config);
+			assert.deepEqual(registeredTools(), ["cancel", "list", "peek", "prompt"], config);
+
+			await fireEvent("session_start");
+			await fireEvent("session_shutdown");
+			await fireEvent("session_start");
+
+			const configWarnings = stubCtx.notifications.filter(({ message }) => /runner\.json/.test(message));
+			assert.equal(configWarnings.length, 1, config);
+			assert.equal(configWarnings[0]!.type, "warning");
+		}
+	});
+
+	it("keeps the invalid-config warning until a session with UI can show it", async () => {
+		await reloadRunner("{not json");
+		stubCtx.ctx.hasUI = false;
+
+		await fireEvent("session_start");
+		assert.equal(stubCtx.notifications.length, 0);
+
+		stubCtx.ctx.hasUI = true;
+		await fireEvent("session_shutdown");
+		await fireEvent("session_start");
+
+		const configWarnings = stubCtx.notifications.filter(({ message }) => /runner\.json/.test(message));
+		assert.equal(configWarnings.length, 1);
+		assert.equal(configWarnings[0]!.type, "warning");
+	});
+
+	it("restores a persisted legacy prompt job under a prompt-only config", async () => {
+		writePersistedJobs([
+			{
+				jobId: "legacy-prompt",
+				message: "Loaded reminder",
+				trigger: { kind: "cron", cron: "0 * * * * *" },
+			},
+		]);
+		await reloadRunner('{"actions":["prompt"]}');
+
+		await fireEvent("session_start");
+
+		const listed = (await runTool("list", {})).details as ScheduledJob[];
+		assert.deepEqual(listed.map(({ jobId }) => jobId), ["legacy-prompt"]);
+		assert.deepEqual(stubCtx.notifications, []);
+	});
+
+	it("drops a persisted command job under a prompt-only config, warns, and prunes the file", async () => {
+		writePersistedJobs([
+			{
+				jobId: "gated-command",
+				action: { kind: "command", command: "printf blocked" },
+				deliverAs: "followUp",
+				trigger: { kind: "cron", cron: "0 * * * * *" },
+			},
+			{
+				jobId: "kept-prompt",
+				action: { kind: "prompt", message: "Still here" },
+				deliverAs: "followUp",
+				trigger: { kind: "cron", cron: "0 * * * * *" },
+			},
+		]);
+		await reloadRunner('{"actions":["prompt"]}');
+
+		await fireEvent("session_start");
+
+		const listed = (await runTool("list", {})).details as ScheduledJob[];
+		assert.deepEqual(listed.map(({ jobId }) => jobId), ["kept-prompt"]);
+		const gateWarnings = stubCtx.notifications.filter(({ message }) => /gated-command/.test(message));
+		assert.equal(gateWarnings.length, 1);
+		assert.equal(gateWarnings[0]!.type, "warning");
+		assert.deepEqual(
+			(readPersistedJobs() as Array<{ jobId: string }>).map(({ jobId }) => jobId),
+			["kept-prompt"],
+		);
+	});
+});
+
 function createStubPi(): StubPi {
 	const handlers = new Map<string, EventHandler>();
 	const sendMessageCalls: StubPi["sendMessageCalls"] = [];
@@ -1263,6 +1377,18 @@ async function runCreator(params: {
 async function fireEvent(name: string): Promise<void> {
 	const handler = stub.handlers.get(name);
 	if (handler) await handler({}, stubCtx.ctx);
+}
+
+function registeredTools(): string[] {
+	return [...stub.tools.keys()].sort();
+}
+
+async function reloadRunner(config: string): Promise<void> {
+	await fireEvent("session_shutdown");
+	fs.writeFileSync(path.join(tempAgentDir, "runner.json"), config);
+	stub = createStubPi();
+	stubCtx = createStubCtx();
+	createRunnerExtension(stub.pi, { spawnSubagentChild: spawnFakeSubagentChild });
 }
 
 function scheduledCron(result: ToolResult) {
