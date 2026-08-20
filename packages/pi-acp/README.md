@@ -11,4 +11,4 @@ pi install npm:@rupertsworld/pi-acp
 - The socket lives in the coding-agent home (`acp.sock`); one live session holds it at a time. With `autoStart` (the default) a starting session binds a free or stale socket automatically; `/acp attach` claims it explicitly (cooperative takeover from a live holder — never forced), and `/acp detach` frees it.
 - `pi-acp` (the package's npm bin) is a stdio↔socket relay for hosts that spawn their ACP agent as a subprocess. An attach-only machine installs it with `npm i -g @rupertsworld/pi-acp`; it has no pi dependency.
 
-`SPEC.md` is the authority on behavior.
+[`spec/pi-acp/index.md`](https://github.com/rupertsworld/pi-tools/blob/main/spec/pi-acp/index.md) is the authority on behavior.

@@ -1,10 +1,10 @@
 # pi-runner — future work
 
-`SPEC.md` covers what runner does today: `{trigger, action, deliverAs}` jobs with `cron`/`once`/`now` triggers and `prompt`/`command`/`subagent` actions, per-job logs + `peek`, per-session persistence, and rendered per-action tools. This doc holds intended expansions. None are built.
+`spec/pi-runner/index.md` covers what runner does today: `{trigger, action, deliverAs}` jobs with `cron`/`once`/`now` triggers and `prompt`/`command`/`subagent` actions, per-job logs + `peek`, per-session persistence, and rendered per-action tools. This doc holds intended expansions. None are built.
 
 ## Direction
 
-- **Pure-scheduler trajectory.** Execution is migrating to environment capabilities (bellhop endpoints reached via pi-http); `command` and `subagent` are transitional conveniences for trusted sessions. Runner's irreplaceable half is injection — time → message into the session with delivery semantics. `runner.json` action gating (`SPEC.md`, Configuration) is how a locked-down session runs prompt-only today.
+- **Pure-scheduler trajectory.** Execution is migrating to environment capabilities (bellhop endpoints reached via pi-http); `command` and `subagent` are transitional conveniences for trusted sessions. Runner's irreplaceable half is injection — time → message into the session with delivery semantics. `runner.json` action gating (`spec/pi-runner/index.md`, Configuration) is how a locked-down session runs prompt-only today.
 - **Multi-agent revisit trigger.** The scheduler stays in-session because the owning agent is one always-open session with a stable session id. A second long-lived agent is the point where a server-hosted (bellhop) cron becomes right and this decision gets reopened.
 
 ## More triggers
@@ -23,7 +23,7 @@ Job logs (`runner/logs/<jobId>.log`) are append-only with no rotation or size ca
 
 ## Persistence
 
-Implemented as specified in `SPEC.md` ("Session scope and persistence") — per-session files at `~/.pi/agent/runner/<sessionId>.json`, restored on `session_start`.
+Implemented as specified in `spec/pi-runner/index.md` ("Session scope and persistence") — per-session files at `~/.pi/agent/runner/<sessionId>.json`, restored on `session_start`.
 
 - Consider an instance- or global-scoped store for standing background jobs. Telegram follows the live Pi instance across session replacement, while runner currently leaves recurring jobs attached to the previous session. Define ownership, migration, duplicate prevention, and how prompt results attach to the active session.
 

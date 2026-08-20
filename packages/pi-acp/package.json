@@ -11,7 +11,6 @@
 	},
 	"files": [
 		"index.ts",
-		"SPEC.md",
 		"README.md",
 		"bin"
 	],
