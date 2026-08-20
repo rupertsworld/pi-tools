@@ -6,7 +6,7 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/telepath-computer/pi-tools.git",
+		"url": "git+https://github.com/rupertsworld/pi-tools.git",
 		"directory": "packages/pi-http"
 	},
 	"files": [
