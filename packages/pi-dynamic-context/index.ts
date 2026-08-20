@@ -1,24 +1,28 @@
 /**
- * Keep pi's startup-loaded prompt resources current for every agent turn.
+ * Keep pi's prompt resources current and append configured context files each turn.
  */
 
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
-import type {
-	BeforeAgentStartEvent,
-	ExtensionAPI,
-	ExtensionContext,
+import {
+	CONFIG_DIR_NAME,
+	type BuildSystemPromptOptions,
+	type ExtensionAPI,
+	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
 interface WatchedPiece {
 	path?: string;
 	content: string;
 	loadedText: string;
-	previousText: string;
 	lastRead: "ok" | "unreadable";
-	renderVariables: boolean;
+}
+
+interface AdditionalFile {
+	path: string;
+	lastRead: "ok" | "unreadable";
 }
 
 interface SessionState {
@@ -26,11 +30,20 @@ interface SessionState {
 	agentDir: string;
 	cwd: string;
 	pieces: WatchedPiece[];
-	warnedFiles: Set<string>;
+	additionalFiles: AdditionalFile[];
+	warnedConfigs: Set<string>;
+	warnedStartupFiles: Set<string>;
+	warnedEmptyLoadedFiles: Set<string>;
+	warnedAdditionalFiles: Set<string>;
 	warnedVariables: Set<string>;
 }
 
-const TEMPLATE_VARIABLE = /\{\{([A-Z0-9_]+)\}\}/g;
+interface ClaimedRegion {
+	start: number;
+	end: number;
+}
+
+const TEMPLATE_VARIABLE = /\{\{\s*([A-Z0-9_]+)\s*\}\}/g;
 
 export default function (pi: ExtensionAPI) {
 	let state = createSessionState();
@@ -41,29 +54,21 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		try {
-			if (!state.initialized) await initialize(state, event);
+			if (!state.initialized) await initialize(state, event.systemPromptOptions, ctx);
 
 			state.cwd = event.systemPromptOptions.cwd;
 			const variables = getVariables(state);
 			let systemPrompt = event.systemPrompt;
+			const claimedRegions: ClaimedRegion[] = [];
 
 			for (const piece of state.pieces) {
 				await refreshPiece(piece, state, ctx);
-				const freshText = piece.renderVariables
-					? renderTemplate(piece.content, variables, state, ctx)
-					: piece.content;
-
-				const staleText = findStaleText(systemPrompt, piece, freshText);
-				if (staleText === undefined) continue;
-				const index = systemPrompt.indexOf(staleText);
-				if (index === -1) continue;
-
-				systemPrompt =
-					systemPrompt.slice(0, index) +
-					freshText +
-					systemPrompt.slice(index + staleText.length);
-				piece.previousText = freshText;
+				const freshText = renderTemplate(piece.content, variables, state, ctx);
+				systemPrompt = substituteClaimedOccurrence(systemPrompt, piece.loadedText, freshText, claimedRegions);
 			}
+
+			const additionalSection = await buildAdditionalSection(state, variables, ctx);
+			if (additionalSection !== undefined) systemPrompt += `\n\n${additionalSection}`;
 
 			if (systemPrompt !== event.systemPrompt) return { systemPrompt };
 		} catch (error) {
@@ -75,15 +80,21 @@ export default function (pi: ExtensionAPI) {
 		description: "Report dynamic system-prompt variables and watched files",
 		handler: async (_args, ctx) => {
 			try {
+				const options = ctx.getSystemPromptOptions();
+				if (!state.initialized) await initialize(state, options, ctx);
+				state.cwd = options.cwd;
+				await refreshAdditionalFiles(state, ctx);
 				const variables = getVariables(state);
 				const variableLines = Object.entries(variables).map(([name, value]) => `{{${name}}}: ${value}`);
-				const fileLines = state.pieces
+				const startupFileLines = state.pieces
 					.filter((piece): piece is WatchedPiece & { path: string } => piece.path !== undefined)
 					.map((piece) => `${piece.path}: ${piece.lastRead}`);
-				const watchedFiles = fileLines.length > 0 ? fileLines.join("\n") : "(none)";
+				const additionalFileLines = state.additionalFiles.map((file) => `${file.path}: ${file.lastRead}`);
+				const startupFiles = startupFileLines.length > 0 ? startupFileLines.join("\n") : "(none)";
+				const additionalFiles = additionalFileLines.length > 0 ? additionalFileLines.join("\n") : "(none)";
 				notify(
 					ctx,
-					`Dynamic context\n\nVariables\n${variableLines.join("\n")}\n\nWatched files\n${watchedFiles}`,
+					`Dynamic context\n\nVariables\n${variableLines.join("\n")}\n\nWatched files\n${startupFiles}\n\nAdditional files\n${additionalFiles}`,
 					"info",
 				);
 			} catch (error) {
@@ -99,38 +110,40 @@ function createSessionState(): SessionState {
 		agentDir: resolveAgentDir(),
 		cwd: process.cwd(),
 		pieces: [],
-		warnedFiles: new Set(),
+		additionalFiles: [],
+		warnedConfigs: new Set(),
+		warnedStartupFiles: new Set(),
+		warnedEmptyLoadedFiles: new Set(),
+		warnedAdditionalFiles: new Set(),
 		warnedVariables: new Set(),
 	};
 }
 
 async function initialize(
 	state: SessionState,
-	event: BeforeAgentStartEvent,
+	options: BuildSystemPromptOptions,
+	ctx: ExtensionContext,
 ): Promise<void> {
 	state.initialized = true;
 	state.agentDir = resolveAgentDir();
-	state.cwd = event.systemPromptOptions.cwd;
+	state.cwd = options.cwd;
 
-	const { customPrompt, appendSystemPrompt, contextFiles } = event.systemPromptOptions;
+	const { customPrompt, appendSystemPrompt, contextFiles } = options;
+	const projectTrusted = ctx.isProjectTrusted();
 	if (customPrompt !== undefined) {
 		state.pieces.push({
-			path: await resolvePromptPath(customPrompt, "SYSTEM.md", state.cwd, state.agentDir),
+			path: await resolvePromptPath(customPrompt, "SYSTEM.md", state.cwd, state.agentDir, projectTrusted),
 			content: customPrompt,
 			loadedText: customPrompt,
-			previousText: customPrompt,
 			lastRead: "ok",
-			renderVariables: true,
 		});
 	}
 	if (appendSystemPrompt !== undefined) {
 		state.pieces.push({
-			path: await resolvePromptPath(appendSystemPrompt, "APPEND_SYSTEM.md", state.cwd, state.agentDir),
+			path: await resolvePromptPath(appendSystemPrompt, "APPEND_SYSTEM.md", state.cwd, state.agentDir, projectTrusted),
 			content: appendSystemPrompt,
 			loadedText: appendSystemPrompt,
-			previousText: appendSystemPrompt,
 			lastRead: "ok",
-			renderVariables: true,
 		});
 	}
 	for (const file of contextFiles ?? []) {
@@ -138,18 +151,9 @@ async function initialize(
 			path: file.path,
 			content: file.content,
 			loadedText: file.content,
-			previousText: file.content,
 			lastRead: "ok",
-			renderVariables: false,
 		});
 	}
-}
-
-function findStaleText(systemPrompt: string, piece: WatchedPiece, freshText: string): string | undefined {
-	for (const candidate of [piece.previousText, piece.loadedText]) {
-		if (candidate !== "" && candidate !== freshText && systemPrompt.includes(candidate)) return candidate;
-	}
-	return undefined;
 }
 
 async function resolvePromptPath(
@@ -157,8 +161,11 @@ async function resolvePromptPath(
 	fileName: "SYSTEM.md" | "APPEND_SYSTEM.md",
 	cwd: string,
 	agentDir: string,
+	projectTrusted: boolean,
 ): Promise<string | undefined> {
-	for (const path of [join(cwd, ".pi", fileName), join(agentDir, fileName)]) {
+	const paths = [join(agentDir, fileName)];
+	if (projectTrusted) paths.unshift(join(cwd, CONFIG_DIR_NAME, fileName));
+	for (const path of paths) {
 		try {
 			if ((await readFile(path, "utf8")) === loadedContent) return path;
 		} catch {
@@ -173,13 +180,119 @@ async function refreshPiece(piece: WatchedPiece, state: SessionState, ctx: Exten
 	try {
 		piece.content = await readFile(piece.path, "utf8");
 		piece.lastRead = "ok";
+		if (piece.loadedText === "" && piece.content !== "" && !state.warnedEmptyLoadedFiles.has(piece.path)) {
+			state.warnedEmptyLoadedFiles.add(piece.path);
+			notify(ctx, `Dynamic context found content in ${piece.path}, which was empty when loaded; run /reload to pick it up.`, "warning");
+		}
 	} catch (error) {
 		piece.lastRead = "unreadable";
-		if (!state.warnedFiles.has(piece.path)) {
-			state.warnedFiles.add(piece.path);
+		if (!state.warnedStartupFiles.has(piece.path)) {
+			state.warnedStartupFiles.add(piece.path);
 			notify(ctx, `Dynamic context could not read ${piece.path}; keeping its last-read content (${describeError(error)}).`, "warning");
 		}
 	}
+}
+
+function substituteClaimedOccurrence(
+	systemPrompt: string,
+	loadedText: string,
+	freshText: string,
+	claimedRegions: ClaimedRegion[],
+): string {
+	if (loadedText === "") return systemPrompt;
+	let index = systemPrompt.indexOf(loadedText);
+	while (index !== -1) {
+		const end = index + loadedText.length;
+		if (!claimedRegions.some((region) => index < region.end && end > region.start)) {
+			const lengthChange = freshText.length - loadedText.length;
+			for (const region of claimedRegions) {
+				if (region.start < end) continue;
+				region.start += lengthChange;
+				region.end += lengthChange;
+			}
+			claimedRegions.push({ start: index, end: index + freshText.length });
+			if (loadedText === freshText) return systemPrompt;
+			return systemPrompt.slice(0, index) + freshText + systemPrompt.slice(end);
+		}
+		index = systemPrompt.indexOf(loadedText, index + 1);
+	}
+	return systemPrompt;
+}
+
+async function buildAdditionalSection(
+	state: SessionState,
+	variables: Record<string, string>,
+	ctx: ExtensionContext,
+): Promise<string | undefined> {
+	const files = await refreshAdditionalFiles(state, ctx);
+	if (files.length === 0) return undefined;
+	const blocks = files.map((file) =>
+		`<context_file path="${file.path}">\n${renderTemplate(file.content, variables, state, ctx)}\n</context_file>`,
+	);
+	return `<dynamic_context>\n\nAdditional context files:\n\n${blocks.join("\n\n")}\n\n</dynamic_context>`;
+}
+
+async function refreshAdditionalFiles(
+	state: SessionState,
+	ctx: ExtensionContext,
+): Promise<Array<{ path: string; content: string }>> {
+	const sources = [{ path: join(state.agentDir, "dynamic-context.json"), base: state.agentDir }];
+	if (ctx.isProjectTrusted()) {
+		sources.push({
+			path: join(state.cwd, CONFIG_DIR_NAME, "dynamic-context.json"),
+			base: state.cwd,
+		});
+	}
+
+	const paths = new Set<string>();
+	for (const source of sources) {
+		const configuredPaths = await readConfig(source.path, state, ctx);
+		for (const configuredPath of configuredPaths) {
+			const path = configuredPath.startsWith("~/")
+				? resolve(homedir(), configuredPath.slice(2))
+				: resolve(source.base, configuredPath);
+			paths.add(path);
+		}
+	}
+
+	state.additionalFiles = [...paths].map((path) => ({ path, lastRead: "unreadable" }));
+	const readableFiles: Array<{ path: string; content: string }> = [];
+	for (const file of state.additionalFiles) {
+		try {
+			const content = await readFile(file.path, "utf8");
+			file.lastRead = "ok";
+			readableFiles.push({ path: file.path, content });
+		} catch (error) {
+			if (!state.warnedAdditionalFiles.has(file.path)) {
+				state.warnedAdditionalFiles.add(file.path);
+				notify(ctx, `Dynamic context could not read ${file.path}; omitting it this turn (${describeError(error)}).`, "warning");
+			}
+		}
+	}
+	return readableFiles;
+}
+
+async function readConfig(path: string, state: SessionState, ctx: ExtensionContext): Promise<string[]> {
+	try {
+		const config = JSON.parse(await readFile(path, "utf8")) as unknown;
+		const files = typeof config === "object" && config !== null && "files" in config
+			? config.files
+			: undefined;
+		if (!Array.isArray(files) || !files.every((file) => typeof file === "string")) {
+			throw new Error('expected an object with a string array at "files"');
+		}
+		return files;
+	} catch (error) {
+		if (isMissingFile(error)) return [];
+		warnConfig(path, error, state, ctx);
+		return [];
+	}
+}
+
+function warnConfig(path: string, error: unknown, state: SessionState, ctx: ExtensionContext): void {
+	if (state.warnedConfigs.has(path)) return;
+	state.warnedConfigs.add(path);
+	notify(ctx, `Dynamic context could not load ${path}; treating it as empty (${describeError(error)}).`, "warning");
 }
 
 function getVariables(state: SessionState, now = new Date()): Record<string, string> {
@@ -188,7 +301,6 @@ function getVariables(state: SessionState, now = new Date()): Record<string, str
 		DATE: formatLocalDate(now),
 		TIME: formatLocalTime(now),
 		TZ: timeZone || formatTimezoneOffset(now),
-		AGENT_DIR: state.agentDir,
 		CWD: state.cwd,
 	};
 }
@@ -231,6 +343,10 @@ function renderTemplate(
 
 function resolveAgentDir(): string {
 	return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+}
+
+function isMissingFile(error: unknown): boolean {
+	return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
 function pad2(value: number): string {
