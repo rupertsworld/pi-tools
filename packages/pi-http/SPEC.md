@@ -7,7 +7,7 @@ An HTTP calling tool for the agent. Instead of shelling out to `curl` — with i
 pi-http is an ordinary pi package:
 
 ```sh
-pi install npm:@telepath-computer/pi-http
+pi install npm:@rupertsworld/pi-http
 ```
 
 It loads through the `packages` array of pi's settings like any other package. It has no dependencies and one optional configuration file (see Configuration).
@@ -26,24 +26,34 @@ Input:
 
 ## Behavior
 
-- Requests are made with Node's global `fetch`; redirects are followed (with a base configured, manually and per-hop checked — see Configuration).
+- Requests are made with Node's global `fetch`; redirects are followed (with a restriction configured, manually and per-hop checked — see Configuration).
 - **Any HTTP status is a normal result** — a 404 is an answer, not a failure (same principle as pi-runner's command exit codes). Tool errors are reserved for invalid input, network failure (DNS, refused connection, TLS), and timeout.
 - The response body is decoded as text when the `content-type` is textual (`text/*`, JSON, XML, form-encoded, or an explicit charset) and capped at **16 KiB, keeping the head** — for responses, the interesting part is the front — with a marker noting how many bytes were dropped. Non-text content-types report the type and size; the body is omitted rather than dumped as bytes.
 - The result text contains the status line, the response `content-type` and size, and the (possibly truncated) body. The structured `details` carry `{ status, headers, contentType, size, truncated, body }`.
 
 ## Configuration
 
-An optional `http.json` in the agent home (`$PI_CODING_AGENT_DIR`, default `~/.pi/agent`) confines the tool to a single origin — for locked-down sessions where the agent's only road out is a capability server:
+An optional `http.json` in the agent home (`$PI_CODING_AGENT_DIR`, default `~/.pi/agent`) confines the tool to a set of allowed servers — for locked-down sessions where the agent's roads out are known in advance:
 
 ```json
-{ "base": "http://bellhop:8770" }
+{ "base": "http://localhost:8770", "allow": ["localhost:*", "api.linear.app"] }
 ```
 
-- `base` is an origin only — `http:` or `https:` scheme, host, optional port. No path (a lone trailing `/` is tolerated), no query, no fragment; anything else is invalid config.
-- With a valid base, `url` may be relative, with or without a leading `/`, resolved against the base per WHATWG URL resolution. An absolute `url` is allowed only when its origin (scheme + host + port) equals the base's; otherwise a tool error naming the base.
-- Redirects are followed manually, capped at 10 hops, and every `Location` is resolved and origin-checked against the base — a cross-origin hop is a tool error. (Automatic following would let the allowed origin 302 the request anywhere.) Per fetch convention, a 303 on anything but GET or HEAD — or a 301/302 answering a POST — turns the next hop into a body-less GET; 307/308 keep the method and body.
-- **Missing file → unrestricted:** exactly the unconfigured behavior above, and a relative `url` stays a tool error. A present file without a `base` key (`{}`) is the same — the restriction lives in the key, not in the file's existence.
-- **Strict schema, fail closed:** `base` is the only recognized key. An unrecognized top-level key (a mistyped `"bsae"` lock), a non-object top level, an unreadable or unparseable file, or an invalid `base` makes every call a tool error naming the config problem. Failing open on a broken config would silently unlock the session.
+Two keys, each optional; either one being present activates the restriction.
+
+- `base` is a single origin — `http:` or `https:` scheme, host, optional port. No path (a lone trailing `/` is tolerated), no query, no fragment; anything else is invalid config. Beyond allowing its origin, a base does what an `allow` entry cannot: `url` may then be relative, with or without a leading `/`, resolved against it per WHATWG URL resolution. Without a base, a relative `url` stays a tool error even when `allow` is set.
+- `allow` is a list of server patterns. Each entry is exactly one of:
+  - `host` — that host over either scheme at its default port (`example.com` allows `http://example.com` and `https://example.com`, not `https://example.com:8443`).
+  - `host:port` — that host and port, either scheme.
+  - `host:*` — any port on that host, either scheme.
+  - `scheme://host[:port]` — an exact origin, same rules as `base`.
+  - `*` — any server; the explicit way to run a restricted session unrestricted (still `http:`/`https:` only).
+
+  Hosts compare case-insensitively and exactly — no subdomain wildcards (`*.example.com` is invalid config). Ports compare by effective port: a URL or entry without an explicit port has its scheme's default (80/443), so `example.com:443` matches `https://example.com`.
+- A request is allowed when its origin equals the base's or matches any `allow` entry; anything else is a tool error naming the allowed set.
+- With the restriction active, redirects are followed manually, capped at 10 hops, and every `Location` is resolved and checked against the full allowed set (base plus `allow`) — a hop to a disallowed server is a tool error; a hop between two allowed servers is permitted, though a hop that changes origin drops the `authorization`, `proxy-authorization`, and `cookie` request headers — per fetch convention, a credential sent to one server never rides a redirect to another. (Automatic following would let an allowed server 302 the request anywhere.) Per fetch convention, a 303 on anything but GET or HEAD — or a 301/302 answering a POST — turns the next hop into a body-less GET; 307/308 keep the method and body.
+- **Missing file → unrestricted:** exactly the unconfigured behavior above, and a relative `url` stays a tool error. A present file with neither key (`{}`) is the same — the restriction lives in the keys, not in the file's existence. An empty list is a present key: `{"allow": []}` with no base refuses every request.
+- **Strict schema, fail closed:** `base` and `allow` are the only recognized keys. An unrecognized top-level key (a mistyped `"alow"` lock), a non-object top level, an unreadable or unparseable file, an invalid `base`, or an `allow` that is not an array of valid patterns makes every call a tool error naming the config problem. Failing open on a broken config would silently unlock the session.
 - The file is read on every call and is human-owned: in a locked-down session the agent has no filesystem tools, so it cannot reach it by construction.
 
 ## Rendering
@@ -58,7 +68,3 @@ An optional `http.json` in the agent home (`$PI_CODING_AGENT_DIR`, default `~/.p
 Recorded here deliberately: auth profiles, env-reference header values, streaming, file upload/download, cookies/sessions, and retries. `curl` via bash remains available for all of these.
 
 Recorded future work: per-base default headers in `http.json` — a header attached to every request to the configured base — so a capability-server credential can ride along without appearing in the agent's context.
-
-## Status
-
-Implemented.

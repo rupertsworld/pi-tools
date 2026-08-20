@@ -24,6 +24,21 @@ type HttpDetails = {
 	body?: string;
 };
 
+type AllowPattern =
+	| { kind: "any"; raw: string }
+	| { kind: "origin"; raw: string; origin: string }
+	| { kind: "host"; raw: string; hostname: string; port: string | null };
+
+type HttpRestriction = {
+	base?: URL;
+	baseRaw?: string;
+	allow: AllowPattern[];
+};
+
+type HttpConfig = {
+	restriction?: HttpRestriction;
+};
+
 type RenderTheme = Pick<Theme, "fg">;
 type RenderableResult = {
 	content: Array<{ type: string; text?: string }>;
@@ -56,9 +71,10 @@ export default function (pi: ExtensionAPI) {
 			const method = params.method ?? "GET";
 			const timeoutSeconds = params.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
 
-			const config = await loadBaseConfig();
+			const config = await loadHttpConfig();
 			if ("error" in config) return errorResult(config.error);
-			const base = config.base;
+			const restriction = config.restriction;
+			const base = restriction?.base;
 
 			let url: URL;
 			try {
@@ -69,8 +85,8 @@ export default function (pi: ExtensionAPI) {
 			if (url.protocol !== "http:" && url.protocol !== "https:") {
 				return errorResult("Invalid URL scheme. The URL must use http:// or https://.");
 			}
-			if (base !== undefined && url.origin !== base.origin) {
-				return errorResult(`Request to ${url.origin} refused: requests are restricted to the configured base ${base.origin}.`);
+			if (restriction !== undefined && !isAllowedServer(url, restriction)) {
+				return errorResult(refusalMessage("Request", url, restriction));
 			}
 			if ((method === "GET" || method === "HEAD") && params.body !== undefined) {
 				return errorResult(`${method} requests cannot include a body.`);
@@ -101,7 +117,7 @@ export default function (pi: ExtensionAPI) {
 				return errorResult(`Invalid HTTP timeout: ${describeError(error)}`);
 			}
 			try {
-				const outcome = base === undefined
+				const outcome = restriction === undefined
 					? {
 						response: await fetch(url, {
 							method,
@@ -110,7 +126,7 @@ export default function (pi: ExtensionAPI) {
 							signal: timeoutSignal,
 						}),
 					}
-					: await fetchWithinBase(url, base, method, headers, body, timeoutSignal);
+					: await fetchWithinRestriction(url, restriction, method, headers, body, timeoutSignal);
 				if ("error" in outcome) return errorResult(outcome.error);
 				const response = outcome.response;
 				const bytes = new Uint8Array(await response.arrayBuffer());
@@ -150,7 +166,7 @@ export default function (pi: ExtensionAPI) {
 	});
 }
 
-async function loadBaseConfig(): Promise<{ base?: URL } | { error: string }> {
+async function loadHttpConfig(): Promise<HttpConfig | { error: string }> {
 	const agentDir = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
 	const configPath = path.join(agentDir, "http.json");
 	let raw: string;
@@ -166,35 +182,46 @@ async function loadBaseConfig(): Promise<{ base?: URL } | { error: string }> {
 	} catch {
 		return { error: `HTTP config ${configPath} is not valid JSON; refusing all requests.` };
 	}
-	// The restriction lives in the "base" key, not in the file's existence: a present
-	// config without "base" is unrestricted. The schema is strict instead — any
-	// unrecognized top-level key fails closed, so a mistyped lock cannot fail open.
+	// The restriction lives in the "base" and "allow" keys, not in the file's
+	// existence. The schema is strict so a mistyped lock cannot fail open.
 	if (!isRecord(parsed) || Array.isArray(parsed)) {
-		return { error: `HTTP config ${configPath} is invalid: expected a JSON object like {"base": "http://host:8770"}; refusing all requests.` };
+		return { error: `HTTP config ${configPath} is invalid: expected a JSON object like {"base": "http://host:8770", "allow": ["host:*"]}; refusing all requests.` };
 	}
-	const unknownKey = Object.keys(parsed).find((key) => key !== "base");
+	const unknownKey = Object.keys(parsed).find((key) => key !== "base" && key !== "allow");
 	if (unknownKey !== undefined) {
-		return { error: `HTTP config ${configPath} is invalid: unrecognized key ${JSON.stringify(unknownKey)} (the only recognized key is "base"); refusing all requests.` };
+		return { error: `HTTP config ${configPath} is invalid: unrecognized key ${JSON.stringify(unknownKey)} (the recognized keys are "base" and "allow"); refusing all requests.` };
 	}
-	if (parsed.base === undefined) return {};
-	if (typeof parsed.base !== "string") return invalidBaseError(configPath);
-	let base: URL;
-	try {
-		base = new URL(parsed.base);
-	} catch {
-		return invalidBaseError(configPath);
+	const hasBase = Object.hasOwn(parsed, "base");
+	const hasAllow = Object.hasOwn(parsed, "allow");
+	if (!hasBase && !hasAllow) return {};
+
+	let base: URL | undefined;
+	let baseRaw: string | undefined;
+	if (hasBase) {
+		if (typeof parsed.base !== "string") return invalidBaseError(configPath);
+		base = parseHttpOrigin(parsed.base);
+		if (base === undefined) return invalidBaseError(configPath);
+		baseRaw = parsed.base;
 	}
-	if (
-		(base.protocol !== "http:" && base.protocol !== "https:")
-		|| base.pathname !== "/"
-		|| base.search !== ""
-		|| base.hash !== ""
-		|| base.username !== ""
-		|| base.password !== ""
-	) {
-		return invalidBaseError(configPath);
+
+	const allow: AllowPattern[] = [];
+	if (hasAllow) {
+		if (!Array.isArray(parsed.allow)) {
+			return { error: `HTTP config ${configPath} is invalid: "allow" must be an array of server patterns; refusing all requests.` };
+		}
+		for (let index = 0; index < parsed.allow.length; index += 1) {
+			const entry = parsed.allow[index];
+			if (typeof entry !== "string") {
+				return { error: `HTTP config ${configPath} is invalid: "allow" entry ${index + 1} must be a string; refusing all requests.` };
+			}
+			const pattern = parseAllowPattern(entry);
+			if (pattern === undefined) {
+				return { error: `HTTP config ${configPath} is invalid: "allow" entry ${JSON.stringify(entry)} is not a valid server pattern; refusing all requests.` };
+			}
+			allow.push(pattern);
+		}
 	}
-	return { base };
+	return { restriction: { ...(base === undefined ? {} : { base, baseRaw }), allow } };
 }
 
 function invalidBaseError(configPath: string): { error: string } {
@@ -203,9 +230,103 @@ function invalidBaseError(configPath: string): { error: string } {
 	};
 }
 
-async function fetchWithinBase(
+function parseHttpOrigin(value: string): URL | undefined {
+	if (!/^https?:\/\/(\[[^\s\]]+\]|[^\s/?#@\\:\[\]]+)(:\d+)?\/?$/i.test(value)) return undefined;
+	let origin: URL;
+	try {
+		origin = new URL(value);
+	} catch {
+		return undefined;
+	}
+	if (
+		(origin.protocol !== "http:" && origin.protocol !== "https:")
+		|| origin.pathname !== "/"
+		|| origin.search !== ""
+		|| origin.hash !== ""
+		|| origin.username !== ""
+		|| origin.password !== ""
+		|| origin.hostname.includes("*")
+	) return undefined;
+	return origin;
+}
+
+function parseAllowPattern(raw: string): AllowPattern | undefined {
+	if (raw === "*") return { kind: "any", raw };
+	if (raw.includes("*")) {
+		if (!raw.endsWith(":*") || raw.slice(0, -2).includes("*")) return undefined;
+	}
+	if (/^[a-z][a-z\d+.-]*:\/\//i.test(raw)) {
+		const origin = parseHttpOrigin(raw);
+		return origin === undefined ? undefined : { kind: "origin", raw, origin: origin.origin };
+	}
+
+	let host = raw;
+	let port: string | null = null;
+	if (raw.endsWith(":*")) {
+		host = raw.slice(0, -2);
+		port = "*";
+	} else {
+		const explicitPort = /^(.*):(\d+)$/.exec(raw);
+		if (explicitPort !== null) {
+			host = explicitPort[1]!;
+			const number = Number(explicitPort[2]);
+			if (number > 65_535) return undefined;
+			port = String(number);
+		}
+	}
+	const hostname = normalizePatternHost(host);
+	return hostname === undefined ? undefined : { kind: "host", raw, hostname, port };
+}
+
+function normalizePatternHost(value: string): string | undefined {
+	if (
+		value === ""
+		|| /[\s/?#@\\]/.test(value)
+		|| (value.includes(":") && !(value.startsWith("[") && value.endsWith("]")))
+	) return undefined;
+	let url: URL;
+	try {
+		url = new URL(`http://${value}`);
+	} catch {
+		return undefined;
+	}
+	if (
+		url.port !== ""
+		|| url.pathname !== "/"
+		|| url.search !== ""
+		|| url.hash !== ""
+		|| url.hostname.includes("*")
+	) return undefined;
+	return url.hostname;
+}
+
+function isAllowedServer(url: URL, restriction: HttpRestriction): boolean {
+	if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+	if (restriction.base !== undefined && url.origin === restriction.base.origin) return true;
+	const effectivePort = url.port || (url.protocol === "http:" ? "80" : "443");
+	return restriction.allow.some((pattern) => {
+		if (pattern.kind === "any") return true;
+		if (pattern.kind === "origin") return url.origin === pattern.origin;
+		if (url.hostname !== pattern.hostname) return false;
+		if (pattern.port === "*") return true;
+		if (pattern.port === null) {
+			return effectivePort === (url.protocol === "http:" ? "80" : "443");
+		}
+		return effectivePort === pattern.port;
+	});
+}
+
+function refusalMessage(subject: "Request" | "Redirect", url: URL, restriction: HttpRestriction): string {
+	const allowedServers = [
+		...(restriction.baseRaw === undefined ? [] : [restriction.baseRaw]),
+		...restriction.allow.map((pattern) => pattern.raw),
+	];
+	return `${subject} to ${url.origin} refused: configured allowed servers are ${JSON.stringify(allowedServers)}.`;
+}
+
+async function fetchWithinRestriction(
 	url: URL,
-	base: URL,
+	restriction: HttpRestriction,
 	method: string,
 	headers: Headers,
 	body: string | undefined,
@@ -232,8 +353,11 @@ async function fetchWithinBase(
 		} catch {
 			return { error: `Redirect to invalid URL: ${location}` };
 		}
-		if (next.origin !== base.origin) {
-			return { error: `Redirect to ${next.origin} refused: requests are restricted to the configured base ${base.origin}.` };
+		if (!isAllowedServer(next, restriction)) {
+			return { error: refusalMessage("Redirect", next, restriction) };
+		}
+		if (next.origin !== currentUrl.origin) {
+			for (const name of ["authorization", "proxy-authorization", "cookie"]) headers.delete(name);
 		}
 		// Per fetch's redirect algorithm: 303 converts anything but GET/HEAD to a
 		// body-less GET, as do 301/302 answering a POST; 307/308 keep method and body.

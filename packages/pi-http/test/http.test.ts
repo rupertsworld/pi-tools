@@ -315,7 +315,307 @@ describe("http tool without a configured base", () => {
 	});
 });
 
+describe("http tool with a configured allow list", () => {
+	it("allows a host:port pattern", async () => {
+		const url = await serve((_request, response) => {
+			response.writeHead(200, { "content-type": "text/plain" });
+			response.end("host-port");
+		});
+		await configureHttp({ allow: [new URL(url).host] });
+
+		const result = await runTool({ url: `${url}/allowed` });
+
+		assert.equal(result.isError, undefined);
+		assert.match(result.content[0]!.text, /host-port/);
+	});
+
+	it("allows a host:* pattern on any port", async () => {
+		const first = await serve((_request, response) => response.end("first"));
+		const second = await serve((_request, response) => response.end("second"));
+		await configureHttp({ allow: [`${new URL(first).hostname}:*`] });
+
+		const firstResult = await runTool({ url: first });
+		const secondResult = await runTool({ url: second });
+
+		assert.equal(firstResult.isError, undefined);
+		assert.equal(secondResult.isError, undefined);
+	});
+
+	it("allows an exact origin pattern and requires its scheme", async () => {
+		let hits = 0;
+		const url = await serve((_request, response) => {
+			hits += 1;
+			response.end("exact");
+		});
+		await configureHttp({ allow: [new URL(url).origin] });
+
+		const allowed = await runTool({ url });
+		assert.equal(allowed.isError, undefined);
+
+		const httpsOrigin = new URL(url);
+		httpsOrigin.protocol = "https:";
+		await configureHttp({ allow: [httpsOrigin.origin] });
+		const refused = await runTool({ url });
+
+		assert.equal(refused.isError, true);
+		assert.match(refused.content[0]!.text, /refused/i);
+		assert.equal(hits, 1);
+	});
+
+	it("allows the lone * pattern", async () => {
+		const url = await serve((_request, response) => response.end("wildcard"));
+		await configureHttp({ allow: ["*"] });
+
+		const result = await runTool({ url });
+
+		assert.equal(result.isError, undefined);
+	});
+
+	it("combines the base origin and allow entries", async () => {
+		const base = await serve((_request, response) => {
+			response.writeHead(200, { "content-type": "text/plain" });
+			response.end("base");
+		});
+		const other = await serve((_request, response) => {
+			response.writeHead(200, { "content-type": "text/plain" });
+			response.end("other");
+		});
+		const allowedEntry = new URL(other).host;
+		await configureHttp({ base, allow: [allowedEntry] });
+
+		const relative = await runTool({ url: "/from-base" });
+		const absolute = await runTool({ url: `${other}/from-allow` });
+
+		assert.equal(relative.isError, undefined);
+		assert.match(relative.content[0]!.text, /base/);
+		assert.equal(absolute.isError, undefined);
+		assert.match(absolute.content[0]!.text, /other/);
+	});
+
+	it("follows a redirect between two allowed servers", async () => {
+		let destinationHits = 0;
+		const destination = await serve((_request, response) => {
+			destinationHits += 1;
+			response.writeHead(200, { "content-type": "text/plain" });
+			response.end("arrived");
+		});
+		const source = await serve((_request, response) => {
+			response.writeHead(302, { location: `${destination}/finish` });
+			response.end();
+		});
+		await configureHttp({ allow: [new URL(source).origin, new URL(destination).origin] });
+
+		const result = await runTool({ url: `${source}/start` });
+
+		assert.equal(result.isError, undefined);
+		assert.match(result.content[0]!.text, /arrived/);
+		assert.equal(destinationHits, 1);
+	});
+
+	it("drops credential headers across an allowed cross-origin redirect", async () => {
+		const seen: Array<{
+			authorization: string | undefined;
+			proxyAuthorization: string | undefined;
+			cookie: string | undefined;
+			xTest: string | string[] | undefined;
+		}> = [];
+		const destination = await serve((request, response) => {
+			seen.push({
+				authorization: request.headers.authorization,
+				proxyAuthorization: request.headers["proxy-authorization"],
+				cookie: request.headers.cookie,
+				xTest: request.headers["x-test"],
+			});
+			response.end("arrived");
+		});
+		const source = await serve((request, response) => {
+			seen.push({
+				authorization: request.headers.authorization,
+				proxyAuthorization: request.headers["proxy-authorization"],
+				cookie: request.headers.cookie,
+				xTest: request.headers["x-test"],
+			});
+			response.writeHead(302, { location: destination });
+			response.end();
+		});
+		await configureHttp({ allow: [new URL(source).origin, new URL(destination).origin] });
+
+		const result = await runTool({
+			url: source,
+			headers: {
+				authorization: "Bearer secret",
+				"proxy-authorization": "Basic secret",
+				cookie: "session=secret",
+				"x-test": "kept",
+			},
+		});
+
+		assert.equal(result.isError, undefined);
+		assert.deepEqual(seen, [
+			{
+				authorization: "Bearer secret",
+				proxyAuthorization: "Basic secret",
+				cookie: "session=secret",
+				xTest: "kept",
+			},
+			{ authorization: undefined, proxyAuthorization: undefined, cookie: undefined, xTest: "kept" },
+		]);
+	});
+
+	it("keeps authorization across a same-origin redirect", async () => {
+		const authorizations: Array<string | undefined> = [];
+		const base = await serve((request, response) => {
+			authorizations.push(request.headers.authorization);
+			if (request.url === "/start") {
+				response.writeHead(302, { location: "/finish" });
+				response.end();
+				return;
+			}
+			response.end("arrived");
+		});
+		await configureHttp({ allow: [new URL(base).origin] });
+
+		const result = await runTool({
+			url: `${base}/start`,
+			headers: { authorization: "Bearer secret" },
+		});
+
+		assert.equal(result.isError, undefined);
+		assert.deepEqual(authorizations, ["Bearer secret", "Bearer secret"]);
+	});
+
+	it("refuses a redirect to a server outside the allow list", async () => {
+		let destinationHits = 0;
+		const destination = await serve((_request, response) => {
+			destinationHits += 1;
+			response.end("not allowed");
+		});
+		const source = await serve((_request, response) => {
+			response.writeHead(302, { location: destination });
+			response.end();
+		});
+		const allowedEntry = new URL(source).origin;
+		await configureHttp({ allow: [allowedEntry] });
+
+		const result = await runTool({ url: source });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /refused/i);
+		assert.ok(result.content[0]!.text.includes(allowedEntry));
+		assert.equal(destinationHits, 0);
+	});
+
+	it("still rejects a relative url when allow is configured without a base", async () => {
+		await configureHttp({ allow: ["*"] });
+
+		const result = await runTool({ url: "/vault/search" });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /http.*https/i);
+	});
+
+	it("refuses every request when allow is an empty list", async () => {
+		let hits = 0;
+		const url = await serve((_request, response) => {
+			hits += 1;
+			response.end("not reached");
+		});
+		await configureHttp({ allow: [] });
+
+		const result = await runTool({ url });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /refused/i);
+		assert.match(result.content[0]!.text, /\[\]/);
+		assert.equal(hits, 0);
+	});
+
+	it("limits a bare host pattern to each scheme's default port", async () => {
+		let hits = 0;
+		const url = await serve((_request, response) => {
+			hits += 1;
+			response.end("not reached");
+		});
+		const allowedEntry = new URL(url).hostname;
+		await configureHttp({ allow: [allowedEntry] });
+
+		const result = await runTool({ url });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /refused/i);
+		assert.ok(result.content[0]!.text.includes(allowedEntry));
+		assert.equal(hits, 0);
+	});
+
+	it("treats an omitted HTTPS port as effective port 443", async () => {
+		const allowedEntry = "127.0.0.1:80";
+		await configureHttp({ allow: [allowedEntry] });
+
+		const result = await runTool({ url: "https://127.0.0.1/" });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /refused/i);
+		assert.ok(result.content[0]!.text.includes(allowedEntry));
+	});
+
+	it("allows a bare host on its HTTP default port", async () => {
+		await configureHttp({ allow: ["127.0.0.1"] });
+
+		const result = await runTool({ url: "http://127.0.0.1/", timeoutSeconds: 0.2 });
+
+		assert.doesNotMatch(result.content[0]!.text, /refused/i);
+	});
+
+	it("allows host:* over HTTPS on a non-default port", async () => {
+		const url = await serve((_request, response) => response.end("unexpected"));
+		const httpsUrl = new URL(url);
+		httpsUrl.protocol = "https:";
+		await configureHttp({ allow: ["127.0.0.1:*"] });
+
+		const result = await runTool({ url: httpsUrl.href, timeoutSeconds: 1 });
+
+		assert.doesNotMatch(result.content[0]!.text, /refused/i);
+	});
+
+	it("matches an explicit port 443 against an omitted HTTPS port", async () => {
+		await configureHttp({ allow: ["127.0.0.1:443"] });
+
+		const result = await runTool({ url: "https://127.0.0.1/" });
+
+		assert.doesNotMatch(result.content[0]!.text, /refused/i);
+	});
+
+	it("matches hosts case-insensitively", async () => {
+		const url = await serve((_request, response) => response.end("allowed"));
+		const localhostUrl = url.replace("127.0.0.1", "localhost");
+		await configureHttp({ allow: ["LOCALHOST:*"] });
+
+		const result = await runTool({ url: localhostUrl });
+
+		assert.equal(result.isError, undefined);
+	});
+
+	it("matches hosts exactly rather than including subdomains", async () => {
+		await configureHttp({ allow: ["example.com:*"] });
+
+		const result = await runTool({ url: "http://sub.example.com/" });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /refused/i);
+	});
+});
+
 describe("http tool with a configured base", () => {
+	it("accepts a bracketed IPv6 origin with a port", async () => {
+		await configureBase("http://[::1]:8770");
+
+		const result = await runTool({ url: "/", body: "not sent" });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /GET.*body/i);
+		assert.doesNotMatch(result.content[0]!.text, /config|refused/i);
+	});
+
 	it("resolves a relative url with a leading slash against the base", async () => {
 		let seen = "";
 		const base = await serve((request, response) => {
@@ -478,6 +778,73 @@ describe("http tool with a configured base", () => {
 		]);
 	});
 
+	for (const status of [301, 302]) {
+		it(`converts a ${status} redirect after POST into a body-less GET without content headers`, async () => {
+			const seen: Array<{
+				method: string;
+				body: string;
+				contentType: string | undefined;
+				contentLength: string | undefined;
+				contentEncoding: string | undefined;
+				contentLanguage: string | undefined;
+				contentLocation: string | undefined;
+			}> = [];
+			const base = await serve(async (request, response) => {
+				seen.push({
+					method: request.method ?? "",
+					body: await readRequest(request),
+					contentType: request.headers["content-type"],
+					contentLength: request.headers["content-length"],
+					contentEncoding: request.headers["content-encoding"],
+					contentLanguage: request.headers["content-language"],
+					contentLocation: request.headers["content-location"],
+				});
+				if (request.url === "/submit") {
+					response.writeHead(status, { location: "/done" });
+					response.end();
+					return;
+				}
+				response.end("done");
+			});
+			await configureBase(base);
+
+			const result = await runTool({
+				url: "/submit",
+				method: "POST",
+				headers: {
+					"content-type": "text/plain",
+					"content-length": "7",
+					"content-encoding": "identity",
+					"content-language": "en",
+					"content-location": "/submit",
+				},
+				body: "payload",
+			});
+
+			assert.equal(result.isError, undefined);
+			assert.deepEqual(seen, [
+				{
+					method: "POST",
+					body: "payload",
+					contentType: "text/plain",
+					contentLength: "7",
+					contentEncoding: "identity",
+					contentLanguage: "en",
+					contentLocation: "/submit",
+				},
+				{
+					method: "GET",
+					body: "",
+					contentType: undefined,
+					contentLength: undefined,
+					contentEncoding: undefined,
+					contentLanguage: undefined,
+					contentLocation: undefined,
+				},
+			]);
+		});
+	}
+
 	it("preserves method and body across 307 and 308 redirects", async () => {
 		const seen: Array<{ method: string; url: string; body: string }> = [];
 		const base = await serve(async (request, response) => {
@@ -553,6 +920,28 @@ describe("http tool with a configured base", () => {
 		assert.match(result.content[0]!.text, /arrived/);
 	});
 
+	it("follows exactly ten redirects and returns the final response", async () => {
+		let hits = 0;
+		const base = await serve((request, response) => {
+			hits += 1;
+			const step = Number((request.url ?? "").slice(1));
+			if (step < 10) {
+				response.writeHead(302, { location: `/${step + 1}` });
+				response.end();
+				return;
+			}
+			response.writeHead(200, { "content-type": "text/plain" });
+			response.end("arrived after ten");
+		});
+		await configureBase(base);
+
+		const result = await runTool({ url: "/0" });
+
+		assert.equal(result.isError, undefined);
+		assert.match(result.content[0]!.text, /arrived after ten/);
+		assert.equal(hits, 11);
+	});
+
 	it("caps a same-origin redirect loop with a tool error", async () => {
 		let hits = 0;
 		const base = await serve((_request, response) => {
@@ -565,14 +954,21 @@ describe("http tool with a configured base", () => {
 		const result = await runTool({ url: "/loop" });
 
 		assert.equal(result.isError, true);
-		assert.match(result.content[0]!.text, /redirect/i);
-		assert.ok(hits <= 11, `expected at most 11 requests, saw ${hits}`);
+		assert.match(result.content[0]!.text, /10 hops/i);
+		assert.equal(hits, 11);
 	});
 });
 
 describe("http tool with a broken config (fails closed)", () => {
 	for (const base of [
 		"http://host:8770/path",
+		"http://example.com/a/..",
+		"http://example.com?",
+		"http://@example.com",
+		"http:example.com",
+		"http://exa\tmple.com",
+		"http://example.com ",
+		"http://example.com:",
 		"ftp://host:8770",
 		"http://host:8770?q=1",
 		"http://host:8770#fragment",
@@ -619,6 +1015,60 @@ describe("http tool with a broken config (fails closed)", () => {
 		assert.match(result.content[0]!.text, /http\.json/);
 		assert.match(result.content[0]!.text, /base/);
 	});
+
+	it("rejects every call when allow is not an array", async () => {
+		await configureHttp({ allow: "example.test" });
+
+		const result = await runTool({ url: "http://example.test/" });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /http\.json/);
+		assert.match(result.content[0]!.text, /allow.*array/i);
+	});
+
+	it("rejects every call when an allow entry is not a string", async () => {
+		await configureHttp({ allow: ["example.test", 42] });
+
+		const result = await runTool({ url: "http://example.test/" });
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]!.text, /http\.json/);
+		assert.match(result.content[0]!.text, /allow.*string/i);
+	});
+
+	for (const entry of [
+		"",
+		"*.example.com",
+		"api.*.example.com",
+		"example.com:",
+		"example.com:65536",
+		"ftp://example.com",
+		"http://example.com/path",
+		"http://example.com?q=1",
+		"http://example.com#fragment",
+		"http://user:pass@example.com",
+		"http://example.com/a/..",
+		"http://example.com?",
+		"http://@example.com",
+		"http:example.com",
+		"http://exa\tmple.com",
+		"http://example.com ",
+		"http://example.com:",
+		"%2a.example.com",
+		"＊.example.com",
+		"http://%2a.example.com",
+	]) {
+		it(`rejects every call when allow contains ${JSON.stringify(entry)}`, async () => {
+			await configureHttp({ allow: [entry] });
+
+			const result = await runTool({ url: "http://example.test/" });
+
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]!.text, /http\.json/);
+			assert.match(result.content[0]!.text, /allow/);
+			assert.ok(result.content[0]!.text.includes(JSON.stringify(entry)));
+		});
+	}
 
 	it("rejects every call when the config is not valid JSON", async () => {
 		await writeFile(path.join(agentDir, "http.json"), "{nope");
@@ -692,7 +1142,11 @@ async function readRequest(request: IncomingMessage): Promise<string> {
 }
 
 async function configureBase(base: string): Promise<void> {
-	await writeFile(path.join(agentDir, "http.json"), JSON.stringify({ base }));
+	await configureHttp({ base });
+}
+
+async function configureHttp(config: object): Promise<void> {
+	await writeFile(path.join(agentDir, "http.json"), JSON.stringify(config));
 }
 
 async function runTool(params: object): Promise<ToolResult> {
