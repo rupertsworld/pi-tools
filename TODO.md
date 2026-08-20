@@ -1,6 +1,6 @@
 # pi-tools TODO
 
-Monorepo of pi packages. Each package is spec-driven — `SPEC.md` is authoritative.
+Monorepo of pi packages. Each package is spec-driven — its `spec/<package>/index.md` is authoritative.
 
 ## Packages
 

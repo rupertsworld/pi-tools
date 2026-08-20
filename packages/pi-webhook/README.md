@@ -14,4 +14,4 @@ pi install npm:@rupertsworld/pi-webhook
 
 Configuration lives in `webhook.json` (`bind`, `port`, `allowedOrigins`). Browser senders are governed by the origin allowlist (server-side enforcement + CORS preflight; `"*"` supported). No token auth by design — bind address bounds machines, the allowlist bounds browser origins.
 
-`SPEC.md` is the authority on behavior.
+[`spec/pi-webhook/index.md`](https://github.com/rupertsworld/pi-tools/blob/main/spec/pi-webhook/index.md) is the authority on behavior.

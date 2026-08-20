@@ -2,7 +2,7 @@
 
 Extensions for [pi](https://github.com/earendil-works/pi-mono), the minimal terminal coding agent. These packages grew out of using pi as a daily, always-on assistant: they give a live session a scheduler, an HTTP ingress, always-fresh context, and an ACP endpoint — each as an ordinary pi package you install into your own setup.
 
-Each package is independently published to npm under the `@rupertsworld` scope and is **spec-driven**: its `SPEC.md` is the authority on desired behavior, written before the code and kept true to it.
+Each package is independently published to npm under the `@rupertsworld` scope and is **spec-driven**: its spec in [`spec/`](spec/) is the authority on desired behavior, written before the code and kept true to it.
 
 ## Packages
 
@@ -48,7 +48,7 @@ node scripts/smoke-dynamic-context.mjs
 
 Time zones, by design: nothing in these packages takes a timezone setting — cron schedules and template variables evaluate in the host zone. The box's clock is the single source of truth.
 
-These packages are young and move fast; the specs are the contract, and behavior not in a SPEC.md shouldn't be relied on.
+These packages are young and move fast; the specs are the contract, and behavior not in a package's spec shouldn't be relied on.
 
 ## License
 

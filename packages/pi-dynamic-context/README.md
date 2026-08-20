@@ -14,4 +14,4 @@ pi install npm:@rupertsworld/pi-dynamic-context
 
 Implementation constraint: exact-content substitution via `before_agent_start` — it never pattern-matches pi's prompt layout, and leaves pieces alone that another extension rewrote.
 
-`SPEC.md` is the authority on behavior.
+[`spec/pi-dynamic-context/index.md`](https://github.com/rupertsworld/pi-tools/blob/main/spec/pi-dynamic-context/index.md) is the authority on behavior.

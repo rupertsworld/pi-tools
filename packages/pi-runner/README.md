@@ -17,4 +17,4 @@ Agent-callable tools (there is no human-facing command):
 
 Jobs persist per session (restored on `/resume`), every job keeps a full log under `runner/logs/`, and the footer shows `runner N scheduled · M running`. Cron evaluates in the host time zone by design. A `runner.json` in the agent home can gate which action kinds register — a locked-down session can run `prompt`-only.
 
-`SPEC.md` is the authority on behavior.
+[`spec/pi-runner/index.md`](https://github.com/rupertsworld/pi-tools/blob/main/spec/pi-runner/index.md) is the authority on behavior.
