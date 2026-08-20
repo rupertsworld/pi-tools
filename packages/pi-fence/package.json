@@ -1,0 +1,30 @@
+{
+	"name": "@rupertsworld/pi-fence",
+	"version": "0.1.0",
+	"description": "Soft workspace boundary for pi: blocks file tools and bash outside the agent home, its symlinked side-doors, and /tmp",
+	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/rupertsworld/pi-tools.git",
+		"directory": "packages/pi-fence"
+	},
+	"files": [
+		"index.ts",
+		"README.md"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"scripts": {
+		"test": "node --test test/*.test.ts"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
+}
