@@ -1,9 +1,9 @@
-# @telepath-computer/pi-webhook
+# @rupertsworld/pi-webhook
 
 An HTTP ingress for a running [pi](https://github.com/earendil-works/pi-mono) session. An external sender — a CLI, a cron job, a web app, another agent — POSTs to a local URL and the message lands in the receiving session (delivered politely: it never interrupts in-progress work).
 
 ```sh
-pi install npm:@telepath-computer/pi-webhook
+pi install npm:@rupertsworld/pi-webhook
 ```
 
 ## Surface

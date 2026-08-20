@@ -1,9 +1,9 @@
-# @telepath-computer/pi-runner
+# @rupertsworld/pi-runner
 
 A job engine for the active [pi](https://github.com/earendil-works/pi-mono) session. The agent registers jobs — a **trigger** (`cron` / `once` / `now`) paired with an **action** (`prompt` / `command` / `subagent`) — and runner performs them on time, routing every result back into the conversation.
 
 ```sh
-pi install npm:@telepath-computer/pi-runner
+pi install npm:@rupertsworld/pi-runner
 ```
 
 ## Surface

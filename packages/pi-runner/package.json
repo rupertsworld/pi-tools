@@ -1,5 +1,5 @@
 {
-	"name": "@telepath-computer/pi-runner",
+	"name": "@rupertsworld/pi-runner",
 	"version": "0.1.0",
 	"description": "Run or schedule prompts, processes, and isolated subagents in the active pi session",
 	"type": "module",

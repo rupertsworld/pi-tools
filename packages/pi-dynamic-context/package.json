@@ -1,5 +1,5 @@
 {
-	"name": "@telepath-computer/pi-dynamic-context",
+	"name": "@rupertsworld/pi-dynamic-context",
 	"version": "0.1.0",
 	"description": "Per-turn refresh of pi's system prompt and context files, with template variables",
 	"type": "module",

@@ -1,5 +1,5 @@
 {
-	"name": "@telepath-computer/pi-acp",
+	"name": "@rupertsworld/pi-acp",
 	"version": "0.1.0",
 	"description": "ACP endpoint for a live pi session over a unix socket, plus the pi-acp stdio relay",
 	"type": "module",

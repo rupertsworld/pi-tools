@@ -1,5 +1,5 @@
 {
-	"name": "@telepath-computer/pi-webhook",
+	"name": "@rupertsworld/pi-webhook",
 	"version": "0.1.0",
 	"description": "HTTP ingress for injecting messages into the active pi session",
 	"type": "module",

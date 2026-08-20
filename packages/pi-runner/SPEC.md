@@ -9,7 +9,7 @@ Actions today are **prompt** (inject a message so the current agent acts on it),
 pi-runner is an ordinary pi package:
 
 ```sh
-pi install npm:@telepath-computer/pi-runner
+pi install npm:@rupertsworld/pi-runner
 ```
 
 It loads through the `packages` array of pi's settings like any other package. It has no dependency on any other pi package.

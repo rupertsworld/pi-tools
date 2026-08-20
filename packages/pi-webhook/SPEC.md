@@ -7,7 +7,7 @@ The webhook extension gives a running pi session an HTTP ingress. An external se
 pi-webhook is an ordinary pi package:
 
 ```sh
-pi install npm:@telepath-computer/pi-webhook
+pi install npm:@rupertsworld/pi-webhook
 ```
 
 It loads through the `packages` array of pi's settings like any other package. No pi fork, wrapper, or special launcher is required.

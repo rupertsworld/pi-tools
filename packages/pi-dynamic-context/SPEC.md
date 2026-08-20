@@ -7,7 +7,7 @@ Keeps the system prompt and context files live during a session. Vanilla pi read
 pi-dynamic-context is an ordinary pi package:
 
 ```sh
-pi install npm:@telepath-computer/pi-dynamic-context
+pi install npm:@rupertsworld/pi-dynamic-context
 ```
 
 It loads through the `packages` array of pi's settings like any other package. No pi fork, wrapper, or special launcher is required.

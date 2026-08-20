@@ -1,9 +1,9 @@
-# @telepath-computer/pi-dynamic-context
+# @rupertsworld/pi-dynamic-context
 
 Keeps a [pi](https://github.com/earendil-works/pi-mono) session's context live. Vanilla pi reads `SYSTEM.md`, `APPEND_SYSTEM.md`, and context files (`AGENTS.md`/`CLAUDE.md`) once at startup; this extension re-reads them before **every agent turn**, so mid-session edits take effect without `/reload` — and renders template variables in your prompt files.
 
 ```sh
-pi install npm:@telepath-computer/pi-dynamic-context
+pi install npm:@rupertsworld/pi-dynamic-context
 ```
 
 ## Surface

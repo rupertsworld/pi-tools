@@ -1,9 +1,9 @@
-# @telepath-computer/pi-http
+# @rupertsworld/pi-http
 
 A structured HTTP calling tool for [pi](https://github.com/earendil-works/pi-mono) agents. Instead of shelling out to `curl`, the agent makes requests through a typed tool — no quoting hazards, house-style rendering, sane response truncation.
 
 ```sh
-pi install npm:@telepath-computer/pi-http
+pi install npm:@rupertsworld/pi-http
 ```
 
 ## Surface

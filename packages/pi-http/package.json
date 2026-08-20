@@ -1,5 +1,5 @@
 {
-	"name": "@telepath-computer/pi-http",
+	"name": "@rupertsworld/pi-http",
 	"version": "0.1.0",
 	"description": "Structured HTTP calling tool for pi agents — typed requests, rendered responses, no curl quoting hazards",
 	"type": "module",

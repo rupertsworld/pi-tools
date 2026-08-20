@@ -7,12 +7,12 @@ The ACP extension gives a running pi session an [ACP](https://agentclientprotoco
 pi-acp is an ordinary pi package:
 
 ```sh
-pi install npm:@telepath-computer/pi-acp
+pi install npm:@rupertsworld/pi-acp
 ```
 
 It loads through the `packages` array of pi's settings like any other package. No pi fork, wrapper, or special launcher is required.
 
-The relay is the same package's npm bin. A machine that only attaches (for example, the one running a Television server) installs it with `npm i -g @telepath-computer/pi-acp`; it has no pi dependency.
+The relay is the same package's npm bin. A machine that only attaches (for example, the one running a Television server) installs it with `npm i -g @rupertsworld/pi-acp`; it has no pi dependency.
 
 ## Behavior
 
