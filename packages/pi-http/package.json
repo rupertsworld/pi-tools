@@ -1,6 +1,6 @@
 {
 	"name": "@rupertsworld/pi-http",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "Structured HTTP calling tool for pi agents — typed requests, rendered responses, no curl quoting hazards",
 	"type": "module",
 	"license": "MIT",
@@ -14,7 +14,9 @@
 		"README.md"
 	],
 	"pi": {
-		"extensions": ["./index.ts"]
+		"extensions": [
+			"./index.ts"
+		]
 	},
 	"scripts": {
 		"test": "node --test test/*.test.ts"

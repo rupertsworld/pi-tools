@@ -1,6 +1,6 @@
 {
 	"name": "@rupertsworld/pi-acp",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "ACP endpoint for a live pi session over a unix socket, plus the pi-acp stdio relay",
 	"type": "module",
 	"license": "MIT",
@@ -15,7 +15,9 @@
 		"bin"
 	],
 	"pi": {
-		"extensions": ["./index.ts"]
+		"extensions": [
+			"./index.ts"
+		]
 	},
 	"bin": {
 		"pi-acp": "./bin/pi-acp.mjs"

@@ -1,6 +1,6 @@
 {
 	"name": "@rupertsworld/pi-webhook",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "HTTP ingress for injecting messages into the active pi session",
 	"type": "module",
 	"license": "MIT",
@@ -14,7 +14,9 @@
 		"README.md"
 	],
 	"pi": {
-		"extensions": ["./index.ts"]
+		"extensions": [
+			"./index.ts"
+		]
 	},
 	"scripts": {
 		"test": "node --test test/*.test.ts"
