@@ -14,8 +14,14 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 
 import { StringEnum, Type } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import {
+	getMarkdownTheme,
+	keyHint,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type Theme,
+} from "@earendil-works/pi-coding-agent";
+import { Markdown, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { Cron } from "croner";
 
 type CronTrigger = {
@@ -115,6 +121,38 @@ interface CommandResult {
 	spawnError?: string;
 }
 
+interface PromptMessageDetails {
+	kind: "prompt";
+	jobId: string;
+}
+
+interface CommandMessageDetails {
+	kind: "command";
+	jobId: string;
+	command: string;
+	exitCode: number | null;
+	stdout: string;
+	stderr: string;
+	truncated: boolean;
+}
+
+interface SubagentMessageDetails {
+	kind: "subagent";
+	jobId: string;
+	status: "settled" | "timed out" | "failed";
+	startedAt: string;
+	endedAt: string;
+}
+
+type RunnerMessageDetails = PromptMessageDetails | CommandMessageDetails | SubagentMessageDetails;
+
+interface SubagentResult {
+	content: string;
+	status: SubagentMessageDetails["status"];
+	startedAt: string;
+	endedAt: string;
+}
+
 interface StreamCapture {
 	tail: Buffer;
 	totalBytes: number;
@@ -154,6 +192,20 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 	const warnedLogJobs = new Set<string>();
 	const { enabledKinds, warning } = readRunnerConfig();
 	let pendingConfigWarning = warning;
+
+	pi.registerMessageRenderer("runner", (message, options, theme) => {
+		// Pi 0.87 supplies outputPad. The pinned 0.81 API omits it, so retain
+		// the current custom-message default when the older runtime calls us.
+		const outputPadValue = (options as { outputPad?: unknown }).outputPad;
+		const outputPad = typeof outputPadValue === "number" ? outputPadValue : 1;
+		return new RunnerMessageComponent(
+			messageContentText(message.content),
+			message.details,
+			options.expanded,
+			outputPad,
+			theme,
+		);
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (pendingConfigWarning && ctx.hasUI) {
@@ -452,24 +504,31 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 
 		try {
 			let content: string;
-			let details: CommandResult | undefined;
+			let details: RunnerMessageDetails;
 			if (job.action.kind === "prompt") {
 				content = job.action.message;
+				details = { kind: "prompt", jobId: job.jobId };
 			} else if (job.action.kind === "command") {
-				details = await executeCommand(job);
-				content = formatCommandResult(details);
+				const result = await executeCommand(job);
+				content = formatCommandResult(result);
+				details = commandDetails(job.jobId, result);
 			} else {
-				content = await executeSubagent(job);
+				const result = await executeSubagent(job);
+				content = result.content;
+				details = {
+					kind: "subagent",
+					jobId: job.jobId,
+					status: result.status,
+					startedAt: result.startedAt,
+					endedAt: result.endedAt,
+				};
 			}
 
 			if (job.active) {
 				try {
 					if (job.action.kind === "prompt") await appendJobLog(job, "prompt fired/delivered");
-					const message = details
-						? { customType: "runner", content, display: true, details: commandDetails(details) }
-						: { customType: "runner", content, display: true };
 					await pi.sendMessage(
-						message,
+						{ customType: "runner", content, display: true, details },
 						deliveryOptions(job.deliverAs),
 					);
 					if (job.action.kind === "subagent") {
@@ -554,9 +613,10 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 		};
 	}
 
-	async function executeSubagent(job: Job): Promise<string> {
+	async function executeSubagent(job: Job): Promise<SubagentResult> {
 		const action = job.action;
 		if (action.kind !== "subagent") throw new Error("Expected a subagent action.");
+		const startedAt = new Date().toISOString();
 		const stderr = createStreamCapture();
 		let latestText = "";
 		let sawMessageEndText = false;
@@ -579,7 +639,12 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 			child = dependencies.spawnSubagentChild(action);
 		} catch (error) {
 			await appendJobLog(job, `subagent failed: ${describeError(error)}`);
-			return formatSubagentResult("", "failed", describeError(error));
+			return {
+				content: formatSubagentResult("", "failed", describeError(error)),
+				status: "failed",
+				startedAt,
+				endedAt: new Date().toISOString(),
+			};
 		}
 		const completed = new Promise<"settled" | "exited">((resolve) => {
 			child.stdout?.on("data", (chunk: Buffer) => {
@@ -628,7 +693,7 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 				if (!settledByAgent) resolve("exited");
 			});
 		});
-		job.running = { child, settled: exited, startedAt: new Date().toISOString() };
+		job.running = { child, settled: exited, startedAt };
 		updateRunnerStatus(job.context);
 		await new Promise<void>((resolve) => {
 			if (child.pid === undefined) {
@@ -665,10 +730,16 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 		}
 		job.running = undefined;
 		updateRunnerStatus(job.context);
+		const endedAt = new Date().toISOString();
 
 		if (outcome === "settled") {
 			await appendJobLog(job, "subagent settled");
-			return formatSubagentResult(latestText, "settled");
+			return {
+				content: formatSubagentResult(latestText, "settled"),
+				status: "settled",
+				startedAt,
+				endedAt,
+			};
 		}
 		const stderrText = finalizeTail(stderr).content;
 		const failure = [
@@ -678,10 +749,20 @@ export default function (pi: ExtensionAPI, dependencies: RunnerDependencies = { 
 			.join("; ") || "child exited before agent_settled";
 		if (outcome === "timedOut") {
 			await appendJobLog(job, "subagent timed out and killed");
-			return formatSubagentResult(latestText, "timed out");
+			return {
+				content: formatSubagentResult(latestText, "timed out"),
+				status: "timed out",
+				startedAt,
+				endedAt,
+			};
 		}
 		await appendJobLog(job, `subagent failed: ${failure}`);
-		return formatSubagentResult(latestText, "failed", failure);
+		return {
+			content: formatSubagentResult(latestText, "failed", failure),
+			status: "failed",
+			startedAt,
+			endedAt,
+		};
 	}
 
 	async function readJobs(ctx: ExtensionContext): Promise<JobDefinition[]> {
@@ -1005,8 +1086,10 @@ function formatCommandResult(result: CommandResult): string {
 	].join("\n");
 }
 
-function commandDetails(result: CommandResult) {
+function commandDetails(jobId: string, result: CommandResult): CommandMessageDetails {
 	return {
+		kind: "command",
+		jobId,
 		command: result.command,
 		exitCode: result.exitCode,
 		stdout: result.stdout,
@@ -1066,6 +1149,156 @@ function deliveryOptions(deliverAs: Delivery) {
 	return { deliverAs, triggerTurn: true };
 }
 
+interface RunnerMessageSummary {
+	line: string;
+	bodyLine?: string;
+}
+
+class RunnerMessageComponent implements Component {
+	private readonly collapsedLines: string[];
+	private readonly expandedLine: string;
+	private readonly expanded: boolean;
+	private readonly markdown: Markdown;
+
+	constructor(
+		content: string,
+		details: unknown,
+		expanded: boolean,
+		outputPad: number,
+		theme: RenderTheme,
+	) {
+		const summary = renderRunnerMessageSummary(content, details, theme);
+		this.collapsedLines = [
+			`${summary.line} ${keyHint("app.tools.expand", "to expand")}`,
+			...(summary.bodyLine === undefined ? [] : [summary.bodyLine]),
+		];
+		this.expandedLine = summary.line;
+		this.expanded = expanded;
+		this.markdown = new Markdown(content, outputPad, 0, getMarkdownTheme());
+	}
+
+	render(width: number): string[] {
+		if (!this.expanded) return this.collapsedLines.map((line) => truncateToWidth(line, width));
+		return [truncateToWidth(this.expandedLine, width), ...this.markdown.render(width)];
+	}
+
+	invalidate(): void {
+		this.markdown.invalidate();
+	}
+}
+
+function renderRunnerMessageSummary(
+	content: string,
+	details: unknown,
+	theme: RenderTheme,
+): RunnerMessageSummary {
+	if (!isRunnerMessageDetails(details)) {
+		return {
+			line: theme.fg("accent", "runner") + theme.fg("muted", ` · ${firstNonEmptyLine(content) ?? ""}`),
+		};
+	}
+
+	if (details.kind === "prompt") {
+		return {
+			line: theme.fg(
+				"muted",
+				`prompt · ${shortJobId(details.jobId)} · "${truncatePreview(content)}"`,
+			),
+		};
+	}
+
+	if (details.kind === "command") {
+		const output = details.exitCode !== null && details.exitCode !== 0 && details.stderr.trim()
+			? details.stderr
+			: details.stdout;
+		const outputLine = lastNonEmptyLine(output);
+		return {
+			line: `${theme.fg(details.exitCode === 0 ? "success" : "error", details.exitCode === 0 ? "✓" : "✗")} ${theme.fg(
+				"muted",
+				`process · ${shortJobId(details.jobId)} · exit ${details.exitCode ?? "null"} · ${truncatePreview(details.command)}`,
+			)}`,
+			...(outputLine === undefined ? {} : { bodyLine: theme.fg("muted", `  ${outputLine}`) }),
+		};
+	}
+
+	const glyphColor = details.status === "settled"
+		? "success"
+		: details.status === "timed out" ? "warning" : "error";
+	const bodyLine = subagentReportPreview(content);
+	return {
+		line: `${theme.fg(glyphColor, details.status === "settled" ? "✓" : "✗")} ${theme.fg(
+			"muted",
+			`subagent · ${shortJobId(details.jobId)} · ${details.status} · ${humanizeDuration(details.startedAt, details.endedAt)}`,
+		)}`,
+		...(bodyLine === undefined ? {} : { bodyLine: theme.fg("muted", `  ${bodyLine}`) }),
+	};
+}
+
+function messageContentText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part): part is Record<string, unknown> => isRecord(part) && part.type === "text")
+		.map((part) => typeof part.text === "string" ? part.text : "")
+		.join("\n");
+}
+
+function subagentReportPreview(content: string): string | undefined {
+	const lines = content.split(/\r?\n/);
+	let lastContentIndex = lines.length - 1;
+	while (lastContentIndex >= 0 && lines[lastContentIndex]!.trim() === "") lastContentIndex--;
+	if (
+		lastContentIndex >= 0
+		&& /^Subagent (?:settled|timed out|failed)(?:[.:]|$)/.test(lines[lastContentIndex]!.trim())
+	) {
+		lines.splice(lastContentIndex, 1);
+	}
+	return firstNonEmptyLine(lines.join("\n"));
+}
+
+function firstNonEmptyLine(text: string): string | undefined {
+	return text.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+}
+
+function lastNonEmptyLine(text: string): string | undefined {
+	const lines = text.split(/\r?\n/);
+	for (let index = lines.length - 1; index >= 0; index--) {
+		const line = lines[index]!.trim();
+		if (line) return line;
+	}
+	return undefined;
+}
+
+function humanizeDuration(startedAt: string, endedAt: string): string {
+	const elapsedMs = Date.parse(endedAt) - Date.parse(startedAt);
+	const totalSeconds = Number.isFinite(elapsedMs) ? Math.max(0, Math.floor(elapsedMs / 1_000)) : 0;
+	if (totalSeconds < 60) return `${totalSeconds}s`;
+	const totalMinutes = Math.floor(totalSeconds / 60);
+	if (totalMinutes < 60) {
+		const seconds = totalSeconds % 60;
+		return `${totalMinutes}m${seconds === 0 ? "" : ` ${seconds}s`}`;
+	}
+	const hours = Math.floor(totalMinutes / 60);
+	const minutes = totalMinutes % 60;
+	return `${hours}h${minutes === 0 ? "" : ` ${minutes}m`}`;
+}
+
+function isRunnerMessageDetails(value: unknown): value is RunnerMessageDetails {
+	if (!isRecord(value) || typeof value.jobId !== "string") return false;
+	if (value.kind === "prompt") return true;
+	if (value.kind === "command") {
+		return typeof value.command === "string"
+			&& (typeof value.exitCode === "number" || value.exitCode === null)
+			&& typeof value.stdout === "string"
+			&& typeof value.stderr === "string"
+			&& typeof value.truncated === "boolean";
+	}
+	return value.kind === "subagent"
+		&& (value.status === "settled" || value.status === "timed out" || value.status === "failed")
+		&& typeof value.startedAt === "string"
+		&& typeof value.endedAt === "string";
+}
+
 type RunnerToolName = "prompt" | "process" | "subagent" | "cancel" | "steer" | "peek" | "list";
 type RenderTheme = Pick<Theme, "fg">;
 type RenderableResult = {
@@ -1076,6 +1309,7 @@ type RenderableResult = {
 
 function toolRenderers(name: RunnerToolName) {
 	return {
+		renderShell: "self" as const,
 		renderCall(
 			args: object,
 			theme: RenderTheme,
@@ -1122,7 +1356,11 @@ function renderToolResult(
 ): string {
 	const fallback = result.content.find((part) => part.type === "text")?.text ?? "";
 	if (isError || result.isError) return theme.fg("error", fallback || `${name} failed`);
-	if (name === "peek") return theme.fg("muted", fallback);
+	if (name === "peek") {
+		if (expanded) return theme.fg("muted", fallback);
+		const lineCount = fallback === "" ? 0 : fallback.split(/\r?\n/).length;
+		return `${theme.fg("muted", `${lineCount} log lines`)} ${keyHint("app.tools.expand", "to expand")}`;
+	}
 	if (name === "list") {
 		const jobs = Array.isArray(result.details) ? result.details.filter(isJobDetails) : [];
 		if (jobs.length === 0) return theme.fg("muted", "No active jobs");

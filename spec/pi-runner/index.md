@@ -88,10 +88,26 @@ List active jobs. Returns an array of `{ jobId, trigger, action, deliverAs, next
 
 ## Tool rendering
 
-All seven tools define `renderCall`/`renderResult` in the house style — accent tool name, muted detail, no raw JSON in the transcript:
+All seven tools set `renderShell: "self"` and define `renderCall`/`renderResult` in the house style — accent tool name, muted detail, no raw JSON in the transcript. Pi adds one blank row before the rendered output but does not add the default box, background, or vertical padding:
 
 - **Calls** render as one line: the tool name plus a compact summary — a ~60-char preview of the prompt/message/command, the trigger as `now` / the relative time / the cron string, `maxMinutes` when set, jobIds as their first 8 characters. Examples: `subagent · "summarize the last 3 commits" · max 5m`, `process · git fetch --all · cron 0 */15 * * * *`, `steer · a7953fc5 · "focus on pi-tools only"`.
-- **Results** render compact by default and fuller when expanded (pi's expanded rendering option): creators as a one-line confirmation with the short jobId and humanized next run (`· running` for now-jobs); `list` as one line per job (short id, kind, preview, next run, running age) instead of a JSON array; `peek` as the log lines themselves in a muted block; `cancel`/`steer` as one-line confirmations; failures in the error color.
+- **Results** render compact by default and fuller when expanded (the pi expanded rendering option): creators as a one-line confirmation with the short jobId and humanized next run (`· running` for now-jobs); `list` as one line per job (short id, kind, preview, next run, running age) instead of a JSON array; `cancel`/`steer` as one-line confirmations; failures in the error color.
+- **`peek` result** renders as one muted line, `<N> log lines`, followed by the `app.tools.expand` key hint while collapsed. `N` is the number of returned log lines. Expanded rendering shows the log lines in the existing muted block. Errors keep the existing error rendering in both states.
+
+## Delivered message rendering
+
+Runner registers a message renderer for the `runner` custom message type. Pi adds one blank row before the component.
+
+Collapsed rendering uses one or two lines:
+
+- **subagent** — line 1 is a status glyph followed by muted `subagent · <first 8 characters of jobId> · <status> · <duration>` and the `app.tools.expand` key hint. Settled uses `✓` in the success color. Timed out uses `✗` in the warning color. Failed uses `✗` in the error color. Duration is calculated from `startedAt` and `endedAt` and rendered as `42s`, `4m 12s`, or `1h 3m`. Line 2 is the first non-empty report line after removing the trailing `Subagent …` status line, indented by two spaces and muted. Line 2 is omitted when the report has no body text.
+- **command** — line 1 is `✓` in the success color for exit code zero or `✗` in the error color for a nonzero or null exit code, followed by muted `process · <first 8 characters of jobId> · exit <code> · <command preview>` and the expand hint. The command preview uses the same approximately 60-character limit as the call renderer. Line 2 is the last non-empty output line, indented by two spaces and muted. It comes from stderr when the exit code is nonzero and stderr contains text, and from stdout otherwise. Line 2 is omitted when the selected output is empty.
+- **prompt** — one muted line, `prompt · <first 8 characters of jobId> · "<preview>"`, followed by the expand hint.
+- **no details** — messages stored before delivery details were added render as one line: `runner` in the accent color, muted ` · <first non-empty content line>`, then the expand hint.
+
+Every collapsed line is cut to one terminal row with `truncateToWidth` at render time.
+
+Expanded rendering uses the same first line without the expand hint, then renders the full unchanged message `content` as Markdown. The Markdown component uses the horizontal `outputPad` supplied by pi.
 
 ## Firing
 
@@ -107,7 +123,7 @@ When a trigger fires, runner performs the action and produces a result:
 - **`cwd`** — defaults to the pi process's working directory. A `cwd` that doesn't exist at fire time produces a spawn-failure result (delivered normally) rather than a schedule-time error — the directory may legitimately exist later.
 - **Overlap** — command jobs run with croner's `protect` option: a firing is skipped while the previous run of the same job is still executing, so a slow command under a fast cron never piles up.
 - **Failure** — a nonzero exit delivers normally (the exit code is the news); a spawn failure delivers an error result the same way. A cron job keeps its schedule after failures.
-- **Truncation** — each stream is capped (8 KiB); over the cap, the tail is kept — errors and summaries live at the end — with a marker noting how many bytes were dropped. The full structured result (command, exit code, truncated streams) also rides in the message `details`.
+- **Truncation** — each stream is capped (8 KiB); over the cap, the tail is kept — errors and summaries live at the end — with a marker noting how many bytes were dropped. The structured message `details` keeps the existing `command`, `exitCode`, `stdout`, `stderr`, and `truncated` fields and adds `kind: "command"` and `jobId`. Message `content` is unchanged. Pi stores `details` in the session for rendering and does not send it to the model.
 - **Lifecycle** — a child still running at `session_shutdown`, or whose job is `cancel`led mid-run, is killed as a process tree (SIGTERM, short grace, SIGKILL). There is no per-command timeout yet; with overlap protection a hung command cannot pile up runs.
 
 ### Subagent execution
@@ -118,7 +134,13 @@ When a trigger fires, runner performs the action and produces a result:
 - **Overlap** — like commands, cron-scheduled subagents use croner's `protect`: a firing is skipped while the previous run is still going.
 - **Lifecycle** — running children are killed (process tree, SIGTERM → grace → SIGKILL) on `cancel` and `session_shutdown`. A `now`/`once` subagent job leaves the job list when its run finishes (`once` semantics); a cron subagent job stays scheduled.
 
-The result is then delivered via `pi.sendMessage({ customType: "runner", content, display: true }, { deliverAs, triggerTurn })`, where `deliverAs` is the job's delivery mode and `triggerTurn` is `true` for `followUp` and `steer` (pi ignores it for `nextTurn`). Runner does not expose `triggerTurn` as a separate job field: the unbundled combinations are degenerate for a scheduler (a `followUp` that never starts a turn is just a worse `nextTurn`), so each mode carries its only sensible pairing.
+The result is then delivered via `pi.sendMessage({ customType: "runner", content, display: true, details }, { deliverAs, triggerTurn })`. Delivery `details` depends on the action:
+
+- **subagent** — `{ kind: "subagent", jobId, status, startedAt, endedAt }`, where `status` is `"settled"`, `"timed out"`, or `"failed"`, and both times are ISO strings. `startedAt` records when the child was spawned.
+- **command** — the fields defined under [Command execution](#command-execution).
+- **prompt** — `{ kind: "prompt", jobId }`.
+
+Message `content` remains exactly the action result described under [Firing](#firing). Pi stores `details` in the session for rendering and does not send it to the model. `deliverAs` is the delivery mode of the job and `triggerTurn` is `true` for `followUp` and `steer` (pi ignores it for `nextTurn`). Runner does not expose `triggerTurn` as a separate job field: the unbundled combinations are degenerate for a scheduler (a `followUp` that never starts a turn is just a worse `nextTurn`), so each mode carries its only sensible pairing.
 
 A **cron** job fires each time its expression matches, until cancelled. A **once** job fires a single time, then is removed automatically.
 

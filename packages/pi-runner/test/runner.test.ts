@@ -6,8 +6,9 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { stripVTControlCharacters } from "node:util";
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { initTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { scheduledJobs } from "croner";
 import { Value } from "typebox/value";
 
@@ -21,6 +22,7 @@ type ToolResult = {
 };
 type ToolDefinition = {
 	parameters?: object;
+	renderShell?: "default" | "self";
 	execute: (
 		toolCallId: string,
 		params: never,
@@ -39,9 +41,23 @@ type ToolDefinition = {
 	) => { render: (width: number) => string[] };
 };
 type RenderTheme = { fg: (color: string, text: string) => string };
+type RunnerMessage = {
+	role: "custom";
+	customType: "runner";
+	content: string;
+	display: true;
+	details?: unknown;
+	timestamp: number;
+};
+type MessageRenderer = (
+	message: RunnerMessage,
+	options: { expanded: boolean; outputPad?: number },
+	theme: RenderTheme,
+) => { render: (width: number) => string[]; invalidate: () => void } | undefined;
 interface StubPi {
 	pi: ExtensionAPI;
 	handlers: Map<string, EventHandler>;
+	messageRenderers: Map<string, MessageRenderer>;
 	sendMessageCalls: Array<{ message: unknown; options: unknown }>;
 	tools: Map<string, ToolDefinition>;
 }
@@ -86,6 +102,8 @@ let stubCtx: StubCtx;
 let tempAgentDir: string;
 const sessionId = "test-session";
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+
+initTheme("dark", false);
 
 beforeEach(() => {
 	tempAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-runner-test-"));
@@ -185,9 +203,6 @@ describe("runner tools", () => {
 			trigger: { kind: "cron", cron: "0 */15 * * * *" },
 		}), "<accent:process><muted: · git fetch --all · cron 0 */15 * * * *>");
 
-		const peekResult = toolResultForRender("first line\nsecond line", { jobId: "a7953fc5-rest", lines: 2, totalBytes: 23 });
-		assert.equal(renderResult("peek", peekResult), "<muted:first line\nsecond line>");
-
 		const jobs: ScheduledJob[] = [{
 			jobId: "a7953fc5-rest",
 			trigger: { kind: "once", at: "+10m" },
@@ -200,6 +215,180 @@ describe("runner tools", () => {
 			content: [{ type: "text", text: "failed badly" }],
 			isError: true,
 		}), "<error:failed badly>");
+	});
+
+	it("uses self-rendered shells for all seven tools", () => {
+		for (const name of ["prompt", "process", "subagent", "cancel", "steer", "peek", "list"]) {
+			assert.equal(stub.tools.get(name)?.renderShell, "self", name);
+		}
+	});
+
+	it("collapses peek results to a line count and expands to the log lines", () => {
+		const result = toolResultForRender(
+			"first line\nsecond line",
+			{ jobId: "a7953fc5-rest", lines: 2, totalBytes: 23 },
+		);
+		const collapsed = stripVTControlCharacters(renderResult("peek", result));
+
+		assert.match(collapsed, /^<muted:2 log lines>.*to expand$/);
+		assert.equal(renderResult("peek", result, true), "<muted:first line\nsecond line>");
+		assert.equal(renderResult("peek", {
+			content: [{ type: "text", text: "No job log found" }],
+			isError: true,
+		}), "<error:No job log found>");
+	});
+
+	it("renders subagent messages collapsed and expanded with status metadata", () => {
+		const message = runnerMessage(
+			"\nFirst report line\nSecond report line\n\nSubagent settled.",
+			{
+				kind: "subagent",
+				jobId: "abcdef01-rest",
+				status: "settled",
+				startedAt: "2026-09-30T00:00:00.000Z",
+				endedAt: "2026-09-30T00:04:12.000Z",
+			},
+		);
+		const collapsed = stripVTControlCharacters(renderMessage(message));
+		assert.match(collapsed, /^<success:✓> <muted:subagent · abcdef01 · settled · 4m 12s>.*to expand$/m);
+		assert.match(collapsed, /\n<muted:  First report line>$/);
+
+		const expanded = stripVTControlCharacters(renderMessage(message, true, 2));
+		assert.match(expanded, /^<success:✓> <muted:subagent · abcdef01 · settled · 4m 12s>\n/);
+		assert.match(expanded, /\n  First report line\n  Second report line\n\s*Subagent settled\.$/);
+		assert.doesNotMatch(expanded.split("\n")[0]!, /to expand/);
+
+		for (const [status, color] of [["timed out", "warning"], ["failed", "error"]] as const) {
+			const rendered = stripVTControlCharacters(renderMessage(runnerMessage(
+				`Report\n\nSubagent ${status}.`,
+				{
+					kind: "subagent",
+					jobId: "12345678-rest",
+					status,
+					startedAt: "2026-09-30T00:00:00.000Z",
+					endedAt: "2026-09-30T01:03:00.000Z",
+				},
+			)));
+			assert.match(rendered, new RegExp(`^<${color}:✗> <muted:subagent · 12345678 · ${status} · 1h 3m>`));
+		}
+
+		const statusOnly = stripVTControlCharacters(renderMessage(runnerMessage(
+			"Subagent settled.",
+			{
+				kind: "subagent",
+				jobId: "seconds1-rest",
+				status: "settled",
+				startedAt: "2026-09-30T00:00:00.000Z",
+				endedAt: "2026-09-30T00:00:42.000Z",
+			},
+		)));
+		assert.match(statusOnly, /^<success:✓> <muted:subagent · seconds1 · settled · 42s>.*to expand$/);
+		assert.equal(statusOnly.includes("\n"), false);
+	});
+
+	it("renders command messages collapsed and expanded with the selected output tail", () => {
+		const content = [
+			"Command: printf hello",
+			"Exit code: 0",
+			"",
+			"stdout:",
+			"first output line\nlast output line",
+			"",
+			"stderr:",
+			"(empty)",
+		].join("\n");
+		const message = runnerMessage(content, {
+			kind: "command",
+			jobId: "command1-rest",
+			command: "printf hello",
+			exitCode: 0,
+			stdout: "first output line\nlast output line\n",
+			stderr: "",
+			truncated: false,
+		});
+
+		const collapsed = stripVTControlCharacters(renderMessage(message));
+		assert.match(collapsed, /^<success:✓> <muted:process · command1 · exit 0 · printf hello>.*to expand$/m);
+		assert.match(collapsed, /\n<muted:  last output line>$/);
+
+		const expanded = stripVTControlCharacters(renderMessage(message, true, 1));
+		assert.match(expanded, /^<success:✓> <muted:process · command1 · exit 0 · printf hello>\n/);
+		assert.match(expanded, /\n Command: printf hello\n Exit code: 0/);
+		assert.doesNotMatch(expanded.split("\n")[0]!, /to expand/);
+
+		const failed = stripVTControlCharacters(renderMessage(runnerMessage("failed", {
+			kind: "command",
+			jobId: "failure1-rest",
+			command: "false",
+			exitCode: 3,
+			stdout: "stdout tail",
+			stderr: "first error\nlast error\n",
+			truncated: false,
+		})));
+		assert.match(failed, /^<error:✗> <muted:process · failure1 · exit 3 · false>/);
+		assert.match(failed, /\n<muted:  last error>$/);
+
+		const spawnFailure = stripVTControlCharacters(renderMessage(runnerMessage("spawn failed", {
+			kind: "command",
+			jobId: "spawnerr-rest",
+			command: "missing-command",
+			exitCode: null,
+			stdout: "",
+			stderr: "",
+			truncated: false,
+		})));
+		assert.match(spawnFailure, /^<error:✗> <muted:process · spawnerr · exit null · missing-command>.*to expand$/);
+		assert.equal(spawnFailure.includes("\n"), false);
+	});
+
+	it("renders prompt messages collapsed and expanded", () => {
+		const message = runnerMessage("Review\nall changes", { kind: "prompt", jobId: "prompt12-rest" });
+		const collapsed = stripVTControlCharacters(renderMessage(message));
+		assert.match(collapsed, /^<muted:prompt · prompt12 · "Review all changes">.*to expand$/);
+
+		const expanded = stripVTControlCharacters(renderMessage(message, true, 3));
+		assert.match(expanded, /^<muted:prompt · prompt12 · "Review all changes">\n   Review\n   all changes$/);
+		assert.doesNotMatch(expanded.split("\n")[0]!, /to expand/);
+
+		const renderer = stub.messageRenderers.get("runner");
+		assert.ok(renderer);
+		const withoutOutputPad = renderer(message, { expanded: true }, renderTheme);
+		assert.ok(withoutOutputPad);
+		assert.match(
+			stripVTControlCharacters(withoutOutputPad.render(2_000).map((line) => line.trimEnd()).join("\n")),
+			/^<muted:prompt · prompt12 · "Review all changes">\n Review\n all changes$/,
+		);
+	});
+
+	it("renders stored runner messages without details in both display states", () => {
+		const message = runnerMessage("\nLegacy first line\nLegacy second line");
+		const collapsed = stripVTControlCharacters(renderMessage(message));
+		assert.match(collapsed, /^<accent:runner><muted: · Legacy first line>.*to expand$/);
+
+		const expanded = stripVTControlCharacters(renderMessage(message, true, 2));
+		assert.match(expanded, /^<accent:runner><muted: · Legacy first line>\n\s*Legacy first line\n  Legacy second line$/);
+		assert.doesNotMatch(expanded.split("\n")[0]!, /to expand/);
+	});
+
+	it("cuts every collapsed message line to the render width", () => {
+		const message = runnerMessage(
+			"A report line that is much too long for the narrow pane\n\nSubagent settled.",
+			{
+				kind: "subagent",
+				jobId: "abcdef01-rest",
+				status: "settled",
+				startedAt: "2026-09-30T00:00:00.000Z",
+				endedAt: "2026-09-30T00:00:42.000Z",
+			},
+		);
+		const lines = renderMessageLines(message, false, 1, 28, plainRenderTheme)
+			.map(stripVTControlCharacters);
+
+		assert.equal(lines.length, 2);
+		for (const line of lines) {
+			assert.ok(line.length <= 28, line);
+			assert.match(line, /\.\.\.$/);
+		}
 	});
 
 	it("renders full job IDs and untruncated previews in expanded creator and list results", () => {
@@ -341,7 +530,12 @@ describe("runner tools", () => {
 
 		assert.deepEqual(stub.sendMessageCalls, [
 			{
-				message: { customType: "runner", content: "Continue the review", display: true },
+				message: {
+					customType: "runner",
+					content: "Continue the review",
+					display: true,
+					details: { kind: "prompt", jobId: (scheduled.details as ScheduledJob).jobId },
+				},
 				options: { triggerTurn: true, deliverAs: "followUp" },
 			},
 		]);
@@ -374,10 +568,19 @@ describe("runner tools", () => {
 		assert.equal(stub.sendMessageCalls.length, 1);
 		const call = stub.sendMessageCalls[0]!;
 		const message = call.message as { content: string; details: Record<string, unknown> };
-		assert.match(message.content, /hello runner/);
-		assert.match(message.content, /exit code: 0/i);
-		assert.match(message.content, new RegExp(escapeRegExp(command)));
+		assert.equal(message.content, [
+			`Command: ${command}`,
+			"Exit code: 0",
+			"",
+			"stdout:",
+			"hello runner",
+			"",
+			"stderr:",
+			"(empty)",
+		].join("\n"));
 		assert.deepEqual(message.details, {
+			kind: "command",
+			jobId: (scheduled.details as ScheduledJob).jobId,
 			command,
 			exitCode: 0,
 			stdout: "hello runner",
@@ -586,8 +789,17 @@ describe("runner tools", () => {
 		assert.equal(listed[0]?.running, true);
 		assert.match(listed[0]?.startedAt ?? "", /^\d{4}-\d\d-\d\dT/);
 		await waitFor(() => stub.sendMessageCalls.length === 1);
-		assert.match((stub.sendMessageCalls[0]!.message as { content: string }).content, /final from message_end/);
-		assert.match((stub.sendMessageCalls[0]!.message as { content: string }).content, /settled/i);
+		const delivered = stub.sendMessageCalls[0]!.message as {
+			content: string;
+			details: Record<string, unknown>;
+		};
+		assert.equal(delivered.content, "final from message_end\n\nSubagent settled.");
+		assert.equal(delivered.details.kind, "subagent");
+		assert.equal(delivered.details.jobId, job.jobId);
+		assert.equal(delivered.details.status, "settled");
+		assert.match(String(delivered.details.startedAt), /^\d{4}-\d\d-\d\dT/);
+		assert.match(String(delivered.details.endedAt), /^\d{4}-\d\d-\d\dT/);
+		assert.ok(Date.parse(String(delivered.details.endedAt)) >= Date.parse(String(delivered.details.startedAt)));
 		assert.deepEqual(stub.sendMessageCalls[0]!.options, { triggerTurn: true, deliverAs: "followUp" });
 		assert.deepEqual((await runTool("list", {})).details, []);
 		assert.deepEqual(readPersistedJobs(), []);
@@ -656,9 +868,11 @@ describe("runner tools", () => {
 		});
 
 		await waitFor(() => stub.sendMessageCalls.length === 1, 1_800);
-		const content = (stub.sendMessageCalls[0]!.message as { content: string }).content;
+		const message = stub.sendMessageCalls[0]!.message as { content: string; details: Record<string, unknown> };
+		const content = message.content;
 		assert.match(content, /partial answer/);
 		assert.match(content, /timed out/i);
+		assert.equal(message.details.status, "timed out");
 	});
 
 	it("delivers a failure note with stderr when a subagent exits before settling", async () => {
@@ -668,9 +882,11 @@ describe("runner tools", () => {
 		});
 
 		await waitFor(() => stub.sendMessageCalls.length === 1);
-		const content = (stub.sendMessageCalls[0]!.message as { content: string }).content;
+		const message = stub.sendMessageCalls[0]!.message as { content: string; details: Record<string, unknown> };
+		const content = message.content;
 		assert.match(content, /failed/i);
 		assert.match(content, /fake stderr tail/);
+		assert.equal(message.details.status, "failed");
 	});
 
 	it("includes both a child error and stderr tail in a subagent failure note", async () => {
@@ -1280,6 +1496,7 @@ describe("runner action gating", () => {
 
 function createStubPi(): StubPi {
 	const handlers = new Map<string, EventHandler>();
+	const messageRenderers = new Map<string, MessageRenderer>();
 	const sendMessageCalls: StubPi["sendMessageCalls"] = [];
 	const tools = new Map<string, ToolDefinition>();
 	const pi = {
@@ -1289,16 +1506,25 @@ function createStubPi(): StubPi {
 		registerTool(tool: ToolDefinition & { name: string }) {
 			tools.set(tool.name, tool);
 		},
+		registerMessageRenderer(customType: string, renderer: MessageRenderer) {
+			messageRenderers.set(customType, renderer);
+		},
 		sendMessage(message: unknown, options: unknown) {
 			sendMessageCalls.push({ message, options });
 		},
 	} as unknown as ExtensionAPI;
-	return { pi, handlers, sendMessageCalls, tools };
+	return { pi, handlers, messageRenderers, sendMessageCalls, tools };
 }
 
 const renderTheme: RenderTheme = {
 	fg(color, text) {
 		return `<${color}:${text}>`;
+	},
+};
+
+const plainRenderTheme: RenderTheme = {
+	fg(_color, text) {
+		return text;
 	},
 };
 
@@ -1315,6 +1541,43 @@ function renderResult(name: string, result: ToolResult, expanded = false): strin
 		.render(2_000)
 		.map((line) => line.trimEnd())
 		.join("\n");
+}
+
+function renderMessage(
+	message: RunnerMessage,
+	expanded = false,
+	outputPad = 1,
+	width = 2_000,
+	theme = renderTheme,
+): string {
+	return renderMessageLines(message, expanded, outputPad, width, theme)
+		.map((line) => line.trimEnd())
+		.join("\n");
+}
+
+function renderMessageLines(
+	message: RunnerMessage,
+	expanded: boolean,
+	outputPad: number,
+	width: number,
+	theme: RenderTheme,
+): string[] {
+	const renderer = stub.messageRenderers.get("runner");
+	assert.ok(renderer);
+	const component = renderer(message, { expanded, outputPad }, theme);
+	assert.ok(component);
+	return component.render(width);
+}
+
+function runnerMessage(content: string, details?: unknown): RunnerMessage {
+	return {
+		role: "custom",
+		customType: "runner",
+		content,
+		display: true,
+		...(details === undefined ? {} : { details }),
+		timestamp: Date.parse("2026-09-30T00:00:00.000Z"),
+	};
 }
 
 function toolResultForRender(text: string, details: unknown): ToolResult {
